@@ -6,8 +6,8 @@ from typing_extensions import assert_never
 import cv2
 import imageio.v2 as imageio
 import numpy as np
+import pycolmap
 import torch
-from pycolmap import SceneManager
 from plyfile import PlyData, PlyElement
 from PIL import Image
 import tqdm
@@ -19,6 +19,17 @@ from .normalize import (
     transform_points,
 )
 import evo.core.geometry as geometry
+
+
+def load_colmap_camera_matrix(colmap_dir: str) -> np.ndarray:
+    reconstruction = pycolmap.Reconstruction(colmap_dir)
+    camera_id = sorted(reconstruction.cameras.keys())[0]
+    cam = reconstruction.cameras[camera_id]
+    fx = float(cam.focal_length_x)
+    fy = float(cam.focal_length_y)
+    cx = float(cam.principal_point_x)
+    cy = float(cam.principal_point_y)
+    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -167,12 +178,7 @@ class Parser:
             assert os.path.exists(
                 colmap_dir
             ), f"COLMAP directory {colmap_dir} does not exist."
-            manager = SceneManager(colmap_dir)
-            manager.load_cameras()
-            camera_id = 1
-            cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+            K = load_colmap_camera_matrix(colmap_dir)
             K[:2, :] /= factor
             self.Ks_dict = {cam_id: K 
                 for i, cam_id in enumerate(self.camera_ids)
@@ -190,6 +196,7 @@ class Parser:
 
         num_sampled = 150000
         num_points = self.points.shape[0]
+        num_sampled = min(num_sampled, num_points)
         pt_indices = np.random.choice(num_points, size=num_sampled, replace=False)
         self.points_sampled = self.points[pt_indices]
         self.points_rgb_sampled = self.points_rgb[pt_indices]

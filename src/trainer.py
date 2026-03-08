@@ -28,7 +28,10 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from fused_ssim import fused_ssim
+try:
+    from fused_ssim import fused_ssim as fused_ssim_fn
+except ImportError:
+    fused_ssim_fn = None
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
@@ -82,6 +85,8 @@ class Config:
     disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Path to checkpoint files used to resume training.
+    resume_ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
@@ -656,6 +661,14 @@ class Runner:
                 )
             )
 
+        if cfg.resume_ckpt is not None:
+            init_step = self.load_train_checkpoint(schedulers) + 1
+            if init_step >= max_steps:
+                raise ValueError(
+                    f"resume step {init_step} is already beyond max_steps={max_steps}."
+                )
+            print(f"Resuming training from step {init_step}")
+
 
         # trainloader
         trainloader = torch.utils.data.DataLoader(
@@ -782,9 +795,12 @@ class Runner:
 
 
             l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            colors_p = colors.permute(0, 3, 1, 2)
+            pixels_p = pixels.permute(0, 3, 1, 2)
+            if fused_ssim_fn is not None:
+                ssimloss = 1.0 - fused_ssim_fn(colors_p, pixels_p, padding="valid")
+            else:
+                ssimloss = 1.0 - self.ssim(colors_p, pixels_p)
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -903,17 +919,46 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                    "optimizers": {
+                        name: optimizer.state_dict()
+                        for name, optimizer in self.optimizers.items()
+                    },
+                    "pose_optimizers": [
+                        optimizer.state_dict() for optimizer in self.pose_optimizers
+                    ],
+                    "intrinsics_optimizers": [
+                        optimizer.state_dict()
+                        for optimizer in self.intrinsics_optimizers
+                    ],
+                    "app_optimizers": [
+                        optimizer.state_dict() for optimizer in self.app_optimizers
+                    ],
+                    "bil_grid_optimizers": [
+                        optimizer.state_dict() for optimizer in self.bil_grid_optimizers
+                    ],
+                    "schedulers": [
+                        scheduler.state_dict() for scheduler in schedulers
+                    ],
+                    "strategy_state": self.strategy_state,
+                }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
+                if cfg.intrinsics_opt:
+                    data["focal_opt"] = self.focal_opt.detach().cpu()
+                    data["pp_opt"] = self.pp_opt.detach().cpu()
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.use_bilateral_grid:
+                    data["bil_grids"] = self.bil_grids.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1353,6 +1398,54 @@ class Runner:
         
         # Log to tensorboard every step
         self.writer.add_scalar('train/epipolar_loss', lepipolar.item(), step)
+
+    def load_train_checkpoint(self, schedulers: List[torch.optim.lr_scheduler._LRScheduler]) -> int:
+        ckpts = [
+            torch.load(file, map_location=self.device, weights_only=False)
+            for file in self.cfg.resume_ckpt
+        ]
+        for k in self.splats.keys():
+            self.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+
+        ckpt0 = ckpts[0]
+        if "optimizers" in ckpt0:
+            for name, optimizer in self.optimizers.items():
+                if name in ckpt0["optimizers"]:
+                    optimizer.load_state_dict(ckpt0["optimizers"][name])
+        for optimizer, state in zip(self.pose_optimizers, ckpt0.get("pose_optimizers", [])):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(
+            self.intrinsics_optimizers, ckpt0.get("intrinsics_optimizers", [])
+        ):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(self.app_optimizers, ckpt0.get("app_optimizers", [])):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(
+            self.bil_grid_optimizers, ckpt0.get("bil_grid_optimizers", [])
+        ):
+            optimizer.load_state_dict(state)
+        for scheduler, state in zip(schedulers, ckpt0.get("schedulers", [])):
+            scheduler.load_state_dict(state)
+        if "strategy_state" in ckpt0:
+            self.strategy_state = ckpt0["strategy_state"]
+        if self.cfg.pose_opt and "pose_adjust" in ckpt0:
+            if self.world_size > 1:
+                self.pose_adjust.module.load_state_dict(ckpt0["pose_adjust"])
+            else:
+                self.pose_adjust.load_state_dict(ckpt0["pose_adjust"])
+        if self.cfg.intrinsics_opt:
+            if "focal_opt" in ckpt0:
+                self.focal_opt.data.copy_(ckpt0["focal_opt"].to(self.device))
+            if "pp_opt" in ckpt0:
+                self.pp_opt.data.copy_(ckpt0["pp_opt"].to(self.device))
+        if self.cfg.app_opt and "app_module" in ckpt0:
+            if self.world_size > 1:
+                self.app_module.module.load_state_dict(ckpt0["app_module"])
+            else:
+                self.app_module.load_state_dict(ckpt0["app_module"])
+        if self.cfg.use_bilateral_grid and "bil_grids" in ckpt0:
+            self.bil_grids.load_state_dict(ckpt0["bil_grids"])
+        return ckpt0["step"]
         
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
@@ -1366,7 +1459,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if cfg.ckpt is not None:
         # run eval only
         ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
+            torch.load(file, map_location=runner.device, weights_only=False)
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
