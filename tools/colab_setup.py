@@ -127,6 +127,8 @@ def ensure_repo_link(repo_dir: Path, scene_root: Path, link_name: str) -> Path:
 
 
 def verify_runtime(repo_dir: Path) -> None:
+    env = os.environ.copy()
+    env.setdefault("MPLBACKEND", "Agg")
     code = """
 import torch
 import pycolmap
@@ -136,7 +138,7 @@ print('cuda_available', torch.cuda.is_available())
 print('torch_cuda', torch.version.cuda)
 print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')
 """
-    run([sys.executable, "-c", code], cwd=repo_dir)
+    run([sys.executable, "-c", code], cwd=repo_dir, env=env)
 
 
 def train(repo_dir: Path, data_link: Path, args: argparse.Namespace) -> None:
@@ -171,6 +173,7 @@ def train(repo_dir: Path, data_link: Path, args: argparse.Namespace) -> None:
         cmd.extend(extra.split())
     env = os.environ.copy()
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    env.setdefault("MPLBACKEND", "Agg")
     run(cmd, cwd=repo_dir, env=env)
 
 
