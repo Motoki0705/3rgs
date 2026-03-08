@@ -106,7 +106,8 @@ def main() -> None:
 
     src_ply = sparse_dir / "points3D.ply"
     if not src_ply.exists():
-        raise FileNotFoundError(f"{src_ply} is missing; generate COLMAP PLY first.")
+        print(f"{src_ply} is missing. Exporting it from COLMAP reconstruction.")
+        reconstruction.export_PLY(str(src_ply))
     shutil.copy2(src_ply, mast3r_dir / "pointcloud.ply")
 
     print(f"Prepared scene: {scene_dir}")

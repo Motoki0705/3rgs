@@ -44,9 +44,6 @@ def collect_image_points(image) -> dict[int, tuple[float, float]]:
 
 def ensure_resized_images(scene_dir: Path, factor: int, image_names: list[str]) -> Path:
     image_dir = scene_dir / ("images" if factor == 1 else f"images_{factor}")
-    if image_dir.exists():
-        return image_dir
-
     source_dir = scene_dir / "images"
     if not source_dir.exists():
         raise FileNotFoundError(f"{source_dir} is missing.")
@@ -55,6 +52,8 @@ def ensure_resized_images(scene_dir: Path, factor: int, image_names: list[str]) 
     for name in image_names:
         src = source_dir / name
         dst = image_dir / name
+        if dst.exists():
+            continue
         with Image.open(src) as image:
             width, height = image.size
             resized = image.resize((width // factor, height // factor), Image.Resampling.LANCZOS)
@@ -94,7 +93,8 @@ def main() -> None:
     train_images = [images_by_stem[stem] for stem in train_stems]
     train_image_points = [collect_image_points(image) for image in train_images]
 
-    image_dir = ensure_resized_images(scene_dir, args.data_factor, [image.name for image in train_images])
+    all_image_names = sorted(image.name for image in reconstruction.images.values())
+    image_dir = ensure_resized_images(scene_dir, args.data_factor, all_image_names)
     actual_sample = imageio.imread(image_dir / train_images[0].name)
     actual_height, actual_width = actual_sample.shape[:2]
     full_width = int(train_images[0].camera.width)
