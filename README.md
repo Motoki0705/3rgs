@@ -34,18 +34,11 @@ Download the original datasets:
 - [Mip-NeRF 360](https://jonbarron.info/mipnerf360/)
 - [DTU](https://drive.google.com/drive/folders/1SJFgt8qhQomHX55Q4xSvYE2C6-8tFll9)
 
-### 2. Download and extract MASt3R-SfM outputs
+### 2. Prepare MASt3R-SfM outputs locally
 
-We provide precomputed MASt3R-SfM results for each dataset:  
-📁 [Google Drive](https://drive.google.com/drive/u/1/folders/1N4KSjWbp5xFhOVZQZ16_UbL60_1Sni9g)
-
-After downloading, extract each archive to the corresponding dataset root:
-
-```bash
-tar -xzf MipNeRF360.tar.gz --strip-components=1 -C YOUR_MIPNERF360_ROOT_PATH
-tar -xzf TnT.tar.gz        --strip-components=1 -C YOUR_TNT_ROOT_PATH
-tar -xzf DTU.tar.gz        --strip-components=1 -C YOUR_DTU_ROOT_PATH
-```
+This repository now supports an integrated preprocessing path through [`scripts/preprocess.py`](scripts/preprocess.py).
+It runs `third_party/mast3r` against `data/<scene>/images`, then packages the resulting poses, intrinsics, point cloud,
+and pair correspondences into the layout expected by `src/datasets/mast3r.py`.
 
 Each scene directory will have the following structure:
 
@@ -53,15 +46,21 @@ Each scene directory will have the following structure:
 your_dataset/
 └── scene/
     ├── images/               # Original RGB images
-    ├── sparse/               # Original GT annotations
     ├── mast3r/               # MASt3R-SfM outputs
     ├── images_train.txt      # Training split list
     ├── images_test.txt       # Testing split list
-    ├── pose_gt_train.npy     # Ground truth train poses
-    └── pose_gt_test.npy      # Ground truth test poses
+    ├── pose_gt_train.npy     # Reference train poses
+    ├── pose_gt_test.npy      # Reference test poses
+    └── mast3r_sfm/           # Raw MASt3R-SfM run directory
 ```
 
-> Note: The MASt3R-SfM pipeline is not yet integrated into this codebase. For now, please refer to the [MASt3R GitHub](https://github.com/naver/mast3r/tree/mast3r_sfm) for details.
+Example:
+
+```bash
+python scripts/preprocess.py \
+    --scene_dir data/tennis_court \
+    --shared_intrinsics
+```
 
 ---
 
