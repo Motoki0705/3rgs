@@ -2,52 +2,40 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
-import pycolmap
 from PIL import Image
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-INVALID_POINT3D_ID = 2**64 - 1
+from utils.tennis_domain import annotation_path, build_manual_pair_matches, load_annotations
 
 
-def load_train_names(scene_dir: Path) -> list[str]:
+def load_train_stems(scene_dir: Path) -> list[str]:
     train_file = scene_dir / "images_train.txt"
     if not train_file.exists():
-        raise FileNotFoundError(
-            f"{train_file} is missing. Run scripts/prepare_colmap_scene.py first."
-        )
+        raise FileNotFoundError(f"{train_file} is missing. Run scripts/preprocess.py first.")
     return [line.strip() for line in train_file.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def encode_xy(x: float, y: float, actual_width: int) -> int:
-    scale = 512.0 / float(actual_width)
-    x_512 = int(np.clip(np.rint(x * scale), 0, 511))
-    y_512 = int(np.clip(np.rint(y * scale), 0, 511))
-    return y_512 * 512 + x_512
-
-
-def collect_image_points(image) -> dict[int, tuple[float, float]]:
-    points: dict[int, tuple[float, float]] = {}
-    for point2d in image.points2D:
-        if not point2d.has_point3D():
-            continue
-        point3d_id = int(point2d.point3D_id)
-        if point3d_id == INVALID_POINT3D_ID:
-            continue
-        xy = np.asarray(point2d.xy, dtype=np.float32)
-        points[point3d_id] = (float(xy[0]), float(xy[1]))
-    return points
+def resolve_train_names(scene_dir: Path, train_stems: list[str]) -> list[str]:
+    image_dir = scene_dir / "images"
+    suffix_by_stem = {path.stem: path.name for path in sorted(image_dir.iterdir()) if path.is_file()}
+    missing = [stem for stem in train_stems if stem not in suffix_by_stem]
+    if missing:
+        raise FileNotFoundError(f"Missing train images under {image_dir}: {missing[:5]}")
+    return [suffix_by_stem[stem] for stem in train_stems]
 
 
 def ensure_resized_images(scene_dir: Path, factor: int, image_names: list[str]) -> Path:
     image_dir = scene_dir / ("images" if factor == 1 else f"images_{factor}")
     source_dir = scene_dir / "images"
-    if not source_dir.exists():
-        raise FileNotFoundError(f"{source_dir} is missing.")
-
     image_dir.mkdir(parents=True, exist_ok=True)
     for name in image_names:
         src = source_dir / name
@@ -61,116 +49,89 @@ def ensure_resized_images(scene_dir: Path, factor: int, image_names: list[str]) 
     return image_dir
 
 
+def encode_xy(x: float, y: float, actual_width: int) -> int:
+    scale = 512.0 / float(actual_width)
+    x_512 = int(np.clip(np.rint(x * scale), 0, 511))
+    y_512 = int(np.clip(np.rint(y * scale), 0, 511))
+    return y_512 * 512 + x_512
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build 3RGS epipolar correspondence tensors from COLMAP tracks."
+        description="Merge manual annotation correspondences into MASt3R-generated epipolar tensors."
     )
     parser.add_argument("--scene_dir", required=True, type=Path)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--data_factor", type=int, default=4)
-    parser.add_argument("--pair_window", type=int, default=2)
-    parser.add_argument("--min_shared_points", type=int, default=64)
-    parser.add_argument("--num_correspondences", type=int, default=256)
+    parser.add_argument("--annotations_json", type=Path, default=None)
+    parser.add_argument("--max_manual_correspondences", type=int, default=40)
+    parser.add_argument("--manual_base_weight", type=float, default=1.0)
     args = parser.parse_args()
 
     scene_dir = args.scene_dir.expanduser().resolve()
-    sparse_dir = scene_dir / "sparse" / "0"
-    if not sparse_dir.exists():
-        sparse_dir = scene_dir / "sparse"
-    if not sparse_dir.exists():
-        raise FileNotFoundError(f"COLMAP sparse directory not found under {scene_dir}")
-
     output_dir = (args.output_dir or scene_dir / "mast3r").expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    reconstruction = pycolmap.Reconstruction(str(sparse_dir))
-    train_stems = load_train_names(scene_dir)
-    images_by_stem = {Path(image.name).stem: image for image in reconstruction.images.values()}
-    missing = [stem for stem in train_stems if stem not in images_by_stem]
-    if missing:
-        raise RuntimeError(f"Train images are missing from COLMAP reconstruction: {missing[:5]}")
-
-    train_images = [images_by_stem[stem] for stem in train_stems]
-    train_image_points = [collect_image_points(image) for image in train_images]
-
-    all_image_names = sorted(image.name for image in reconstruction.images.values())
-    image_dir = ensure_resized_images(scene_dir, args.data_factor, all_image_names)
-    actual_sample = imageio.imread(image_dir / train_images[0].name)
+    train_stems = load_train_stems(scene_dir)
+    train_names = resolve_train_names(scene_dir, train_stems)
+    image_dir = ensure_resized_images(scene_dir, args.data_factor, train_names)
+    actual_sample = imageio.imread(image_dir / train_names[0])
     actual_height, actual_width = actual_sample.shape[:2]
-    full_width = int(train_images[0].camera.width)
-    full_height = int(train_images[0].camera.height)
-    scale_x = actual_width / float(full_width)
-    scale_y = actual_height / float(full_height)
-    num_corr = args.num_correspondences
+    _ = actual_height
 
-    corr_i_all: list[np.ndarray] = []
-    corr_j_all: list[np.ndarray] = []
-    corr_mask_all: list[np.ndarray] = []
-    corr_weight_all: list[np.ndarray] = []
-    corr_batch_idx_all: list[np.ndarray] = []
-    ei_all: list[int] = []
-    ej_all: list[int] = []
+    corr_i = np.load(output_dir / "corr_i.npy")
+    corr_j = np.load(output_dir / "corr_j.npy")
+    corr_mask = np.load(output_dir / "corr_mask.npy")
+    corr_weight = np.load(output_dir / "corr_weight.npy")
+    corr_batch_idx = np.load(output_dir / "corr_batch_idx.npy")
+    ei = np.load(output_dir / "ei.npy")
+    ej = np.load(output_dir / "ej.npy")
 
-    for i in range(len(train_images)):
-        for offset in range(1, args.pair_window + 1):
-            j = i + offset
-            if j >= len(train_images):
-                break
+    if (output_dir / "corr_is_manual.npy").exists():
+        corr_is_manual = np.load(output_dir / "corr_is_manual.npy")
+    else:
+        corr_is_manual = np.zeros_like(corr_mask, dtype=np.float32)
 
-            shared_ids = list(set(train_image_points[i].keys()) & set(train_image_points[j].keys()))
-            if len(shared_ids) < args.min_shared_points:
-                continue
+    total_corr = corr_i.shape[1]
+    if total_corr < args.max_manual_correspondences:
+        raise ValueError(
+            f"corr_i.npy only has {total_corr} slots, fewer than max_manual_correspondences={args.max_manual_correspondences}."
+        )
+    manual_offset = total_corr - args.max_manual_correspondences
 
-            weighted_matches = []
-            for point3d_id in shared_ids:
-                point3d = reconstruction.points3D[point3d_id]
-                xi, yi = train_image_points[i][point3d_id]
-                xj, yj = train_image_points[j][point3d_id]
-                weight = 1.0 / (1.0 + float(point3d.error))
-                weighted_matches.append((weight, xi, yi, xj, yj))
+    payload = load_annotations(annotation_path(scene_dir, args.annotations_json))
 
-            weighted_matches.sort(key=lambda item: item[0], reverse=True)
-            selected = weighted_matches[:num_corr]
+    for pair_idx, (left_idx, right_idx) in enumerate(zip(ei.tolist(), ej.tolist())):
+        left_name = train_names[left_idx]
+        right_name = train_names[right_idx]
+        manual_matches = build_manual_pair_matches(payload, left_name, right_name)
 
-            corr_i = np.zeros((num_corr,), dtype=np.int64)
-            corr_j = np.zeros((num_corr,), dtype=np.int64)
-            corr_mask = np.zeros((num_corr,), dtype=np.float32)
-            corr_weight = np.zeros((num_corr,), dtype=np.float32)
-            corr_batch_idx = np.zeros((num_corr,), dtype=np.int64)
+        corr_i[pair_idx, manual_offset:] = 0
+        corr_j[pair_idx, manual_offset:] = 0
+        corr_mask[pair_idx, manual_offset:] = 0.0
+        corr_weight[pair_idx, manual_offset:] = 0.0
+        corr_is_manual[pair_idx, manual_offset:] = 0.0
+        corr_batch_idx[pair_idx, manual_offset:] = 0
 
-            for idx, (weight, xi, yi, xj, yj) in enumerate(selected):
-                corr_i[idx] = encode_xy(xi * scale_x, yi * scale_y, actual_width)
-                corr_j[idx] = encode_xy(xj * scale_x, yj * scale_y, actual_width)
-                corr_mask[idx] = 1.0
-                corr_weight[idx] = weight
+        for manual_idx, (_, xy_i, xy_j) in enumerate(manual_matches[: args.max_manual_correspondences]):
+            slot = manual_offset + manual_idx
+            corr_i[pair_idx, slot] = encode_xy(float(xy_i[0]), float(xy_i[1]), actual_width)
+            corr_j[pair_idx, slot] = encode_xy(float(xy_j[0]), float(xy_j[1]), actual_width)
+            corr_mask[pair_idx, slot] = 1.0
+            corr_weight[pair_idx, slot] = args.manual_base_weight
+            corr_is_manual[pair_idx, slot] = 1.0
 
-            corr_i_all.append(corr_i)
-            corr_j_all.append(corr_j)
-            corr_mask_all.append(corr_mask)
-            corr_weight_all.append(corr_weight)
-            corr_batch_idx_all.append(corr_batch_idx)
-            ei_all.append(i)
-            ej_all.append(j)
+    np.save(output_dir / "corr_i.npy", corr_i)
+    np.save(output_dir / "corr_j.npy", corr_j)
+    np.save(output_dir / "corr_batch_idx.npy", corr_batch_idx)
+    np.save(output_dir / "corr_mask.npy", corr_mask)
+    np.save(output_dir / "corr_weight.npy", corr_weight)
+    np.save(output_dir / "corr_is_manual.npy", corr_is_manual)
 
-    if not corr_i_all:
-        raise RuntimeError("No train pairs satisfied the correspondence threshold.")
-
-    num_train = len(train_images)
-    depthmaps = np.zeros((num_train, 1, 1), dtype=np.float32)
-
-    np.save(output_dir / "corr_i.npy", np.stack(corr_i_all))
-    np.save(output_dir / "corr_j.npy", np.stack(corr_j_all))
-    np.save(output_dir / "corr_batch_idx.npy", np.stack(corr_batch_idx_all))
-    np.save(output_dir / "corr_mask.npy", np.stack(corr_mask_all))
-    np.save(output_dir / "corr_weight.npy", np.stack(corr_weight_all))
-    np.save(output_dir / "ei.npy", np.asarray(ei_all, dtype=np.int64))
-    np.save(output_dir / "ej.npy", np.asarray(ej_all, dtype=np.int64))
-    np.save(output_dir / "depthmaps.npy", depthmaps)
-
-    print(f"Prepared epipolar data: {output_dir}")
-    print(f"Train images: {num_train}")
-    print(f"Pairs: {len(corr_i_all)}")
-    print(f"Correspondences per pair: {num_corr}")
+    print(f"Updated epipolar data: {output_dir}")
+    print(f"Train images: {len(train_names)}")
+    print(f"Pairs: {len(ei)}")
+    print(f"Manual correspondence slots per pair: {args.max_manual_correspondences}")
 
 
 if __name__ == "__main__":

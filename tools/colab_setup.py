@@ -98,12 +98,12 @@ def extract_scene_tar(local_tar: Path, data_root: Path, scene_name: str, overwri
 
 
 def resolve_scene_root(scene_dir: Path) -> Path:
-    if (scene_dir / "images").exists() and (scene_dir / "sparse" / "0").exists():
+    if (scene_dir / "images").exists():
         return scene_dir
     children = [path for path in scene_dir.iterdir() if path.is_dir()]
     if len(children) == 1:
         child = children[0]
-        if (child / "images").exists() and (child / "sparse" / "0").exists():
+        if (child / "images").exists():
             print(f"Using nested scene root: {child}", flush=True)
             return child
     return scene_dir
@@ -111,7 +111,7 @@ def resolve_scene_root(scene_dir: Path) -> Path:
 
 def validate_training_layout(scene_dir: Path) -> Path:
     scene_root = resolve_scene_root(scene_dir)
-    required = ["images", "sparse/0"]
+    required = ["images"]
     missing = [rel for rel in required if not (scene_root / rel).exists()]
     if missing:
         raise RuntimeError(f"Extracted scene is missing required paths: {missing}")
@@ -124,6 +124,33 @@ def ensure_repo_link(repo_dir: Path, scene_root: Path, link_name: str) -> Path:
         link_path.unlink()
     link_path.symlink_to(scene_root)
     return link_path
+
+
+def has_prepared_scene(scene_root: Path) -> bool:
+    required = [
+        scene_root / "images_train.txt",
+        scene_root / "images_test.txt",
+        scene_root / "pose_gt_train.npy",
+        scene_root / "pose_gt_test.npy",
+        scene_root / "mast3r" / "camera_intrinsics.npy",
+        scene_root / "mast3r" / "camera_poses.npy",
+        scene_root / "mast3r" / "pointcloud.ply",
+    ]
+    return all(path.exists() for path in required)
+
+
+def has_prepared_epipolar(scene_root: Path) -> bool:
+    required = [
+        scene_root / "mast3r" / "corr_i.npy",
+        scene_root / "mast3r" / "corr_j.npy",
+        scene_root / "mast3r" / "corr_mask.npy",
+        scene_root / "mast3r" / "corr_weight.npy",
+        scene_root / "mast3r" / "corr_batch_idx.npy",
+        scene_root / "mast3r" / "ei.npy",
+        scene_root / "mast3r" / "ej.npy",
+        scene_root / "mast3r" / "depthmaps.npy",
+    ]
+    return all(path.exists() for path in required)
 
 
 def verify_runtime(repo_dir: Path) -> None:
@@ -184,7 +211,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--drive-mount-point", default=str(DEFAULT_DRIVE_MOUNT))
     parser.add_argument("--result-dir", default=str(DEFAULT_RESULT_ROOT / "tennis_court_colab"))
-    parser.add_argument("--repo-data-link-name", default="data_tennis_court")
+    parser.add_argument("--repo-data-link-name", default="data_scene")
     parser.add_argument("--data-factor", type=int, default=4)
     parser.add_argument("--pair-window", type=int, default=2)
     parser.add_argument("--min-shared-points", type=int, default=64)
@@ -258,19 +285,23 @@ def main() -> None:
     if should_run("prepare_scene"):
         if scene_root is None:
             raise RuntimeError("Scene root is unavailable. Run extract_tar first.")
-        enter_phase("prepare_scene", "creating MASt3R-style metadata and repo data link")
+        enter_phase("prepare_scene", "running integrated MASt3R preprocessing and creating repo data link")
         data_link = ensure_repo_link(repo_dir, scene_root, args.repo_data_link_name)
-        run(
-            [
-                sys.executable,
-                "scripts/prepare_colmap_scene.py",
-                "--scene_dir",
-                str(data_link),
-                "--test_every",
-                "8",
-            ],
-            cwd=repo_dir,
-        )
+        if has_prepared_scene(scene_root):
+            print(f"Found prepackaged MASt3R scene metadata under {scene_root}; skipping preprocess.py", flush=True)
+        else:
+            run(
+                [
+                    sys.executable,
+                    "scripts/preprocess.py",
+                    "--scene_dir",
+                    str(data_link),
+                    "--test_every",
+                    "8",
+                    "--shared_intrinsics",
+                ],
+                cwd=repo_dir,
+            )
     elif end_idx >= PHASES.index("prepare_scene") and scene_root is not None:
         data_link = ensure_repo_link(repo_dir, scene_root, args.repo_data_link_name)
 
@@ -278,23 +309,26 @@ def main() -> None:
         if data_link is None:
             raise RuntimeError("Data link is unavailable. Run prepare_scene first.")
         enter_phase("prepare_epipolar", "building epipolar correspondence tensors")
-        run(
-            [
-                sys.executable,
-                "scripts/prepare_epipolar_data.py",
-                "--scene_dir",
-                str(data_link),
-                "--data_factor",
-                str(args.data_factor),
-                "--pair_window",
-                str(args.pair_window),
-                "--min_shared_points",
-                str(args.min_shared_points),
-                "--num_correspondences",
-                str(args.num_correspondences),
-            ],
-            cwd=repo_dir,
-        )
+        if has_prepared_epipolar(scene_root or data_link):
+            print(f"Found prepackaged epipolar tensors under {scene_root or data_link}; skipping prepare_epipolar_data.py", flush=True)
+        else:
+            run(
+                [
+                    sys.executable,
+                    "scripts/prepare_epipolar_data.py",
+                    "--scene_dir",
+                    str(data_link),
+                    "--data_factor",
+                    str(args.data_factor),
+                    "--pair_window",
+                    str(args.pair_window),
+                    "--min_shared_points",
+                    str(args.min_shared_points),
+                    "--num_correspondences",
+                    str(args.num_correspondences),
+                ],
+                cwd=repo_dir,
+            )
 
     if should_run("verify_runtime"):
         enter_phase("verify_runtime", "verifying torch, CUDA, and package imports")

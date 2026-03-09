@@ -6,7 +6,6 @@ from typing_extensions import assert_never
 import cv2
 import imageio.v2 as imageio
 import numpy as np
-import pycolmap
 import torch
 from plyfile import PlyData, PlyElement
 from PIL import Image
@@ -19,18 +18,6 @@ from .normalize import (
     transform_points,
 )
 import evo.core.geometry as geometry
-
-
-def load_colmap_camera_matrix(colmap_dir: str) -> np.ndarray:
-    reconstruction = pycolmap.Reconstruction(colmap_dir)
-    camera_id = sorted(reconstruction.cameras.keys())[0]
-    cam = reconstruction.cameras[camera_id]
-    fx = float(cam.focal_length_x)
-    fy = float(cam.focal_length_y)
-    cx = float(cam.principal_point_x)
-    cy = float(cam.principal_point_y)
-    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []
@@ -140,6 +127,13 @@ class Parser:
 
 
         self.image_paths = [os.path.join(data_dir, 'images' + image_dir_suffix, file) for file in filelist]  # List[str], (num_images,)
+        self.court_mask_paths = {}
+        mask_dir = os.path.join(data_dir, "annotations", f"court_masks_factor{factor}")
+        if os.path.exists(mask_dir):
+            for file in filelist:
+                candidate = os.path.join(mask_dir, file)
+                if os.path.exists(candidate):
+                    self.court_mask_paths[file] = candidate
 
         # handle factor
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
@@ -167,22 +161,6 @@ class Parser:
         self.camtoworlds_gt = camtoworlds_gt # np.ndarray, (num_images, 4, 4)
         self.camera_ids = [i + 1 for i in range(camtoworlds.shape[0])]  # List[int], (num_images,)
         self.Ks_dict = {cam_id: self.intrinsics[i] for i, cam_id in enumerate(self.camera_ids)}  # Dict of camera_id -> K
-
-        # use gt intrinsics
-        use_gt_intrinsics = True
-        if use_gt_intrinsics:
-            colmap_dir = os.path.join(data_dir, "sparse/0/")
-            print(colmap_dir)
-            if not os.path.exists(colmap_dir):
-                colmap_dir = os.path.join(data_dir, "sparse")
-            assert os.path.exists(
-                colmap_dir
-            ), f"COLMAP directory {colmap_dir} does not exist."
-            K = load_colmap_camera_matrix(colmap_dir)
-            K[:2, :] /= factor
-            self.Ks_dict = {cam_id: K 
-                for i, cam_id in enumerate(self.camera_ids)
-            }            
 
         self.intrinsics[:,:,:] = self.Ks_dict[1]
         self.params_dict = {cam_id: [] for cam_id in self.camera_ids}  # Dict of camera_id -> params
@@ -288,6 +266,7 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         camtoworlds_gt = self.parser.camtoworlds_gt[index]
         mask = self.parser.mask_dict[camera_id]
+        court_mask_path = self.parser.court_mask_paths.get(self.parser.image_names[index])
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -317,6 +296,11 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if court_mask_path is not None:
+            court_mask = imageio.imread(court_mask_path)
+            if court_mask.ndim == 3:
+                court_mask = court_mask[..., 0]
+            data["court_mask"] = torch.from_numpy((court_mask > 0).astype(np.float32))
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -366,6 +350,11 @@ class CorrespondenceDataset():
         self.corr_batch_idx = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_batch_idx.npy')))
         self.corr_mask = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_mask.npy')))
         self.corr_weight = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_weight.npy')))
+        corr_is_manual_path = os.path.join(data_dir, 'corr_is_manual.npy')
+        if os.path.exists(corr_is_manual_path):
+            self.corr_is_manual = torch.from_numpy(np.load(corr_is_manual_path))
+        else:
+            self.corr_is_manual = torch.zeros_like(self.corr_weight)
         self.ei = torch.from_numpy(np.load(os.path.join(data_dir, 'ei.npy')))
         self.ej = torch.from_numpy(np.load(os.path.join(data_dir, 'ej.npy')))
         self.depthmaps = torch.from_numpy(np.load(os.path.join(data_dir, 'depthmaps.npy')))
@@ -385,6 +374,7 @@ class CorrespondenceDataset():
         self.corr_i = self.corr_i[::pairs_step,::cores_step]
         self.corr_j = self.corr_j[::pairs_step,::cores_step]
         self.corr_weight = self.corr_weight[::pairs_step,::cores_step]
+        self.corr_is_manual = self.corr_is_manual[::pairs_step,::cores_step]
         self.corr_mask = self.corr_mask[::pairs_step,::cores_step]
         self.corr_batch_idx = self.corr_batch_idx[:len(self.ei),::cores_step]
         
@@ -394,6 +384,7 @@ class CorrespondenceDataset():
         assert len(self.corr_batch_idx) == self.length
         assert len(self.corr_mask) == self.length
         assert len(self.corr_weight) == self.length
+        assert len(self.corr_is_manual) == self.length
         assert len(self.ei) == self.length
         assert len(self.ej) == self.length
 
@@ -474,6 +465,7 @@ class CorrespondenceDataset():
             'ej_all': self.ej,
             'corr_mask_all': self.corr_mask,
             'corr_weight_all': self.corr_weight,
+            'corr_is_manual_all': self.corr_is_manual,
             'corr_points_i_all': self.corr_points_i,
             'corr_points_j_all': self.corr_points_j,
         }
@@ -517,6 +509,7 @@ class CorrespondenceDataset():
             'corr_batch_idx': self.corr_batch_idx[0].reshape(1, -1),  # batch_size = 1
             'corr_mask': self.corr_mask[idx].reshape(1, -1),  
             'corr_weight': self.corr_weight[idx].reshape(1, -1),  
+            'corr_is_manual': self.corr_is_manual[idx].reshape(1, -1),
             'ei': self.ei[idx],  
             'ej': self.ej[idx],
             'depthmaps': torch.stack([self.depthmaps[self.ei[idx]], self.depthmaps[self.ej[idx]]])
