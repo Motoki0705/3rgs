@@ -1,0 +1,3 @@
+[submodule "third_party/mast3r"]
+	path = third_party/mast3r
+	url = https://github.com/Motoki0705/mast3r
