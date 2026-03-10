@@ -2,17 +2,18 @@ import json
 import os
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
 import evo
 import numpy as np
 import torch
 from evo.core import metrics, trajectory
 from evo.core.metrics import PoseRelation, Unit
 from evo.core.trajectory import PosePath3D, PoseTrajectory3D
+from evo.tools.settings import SETTINGS
+SETTINGS.plot_backend = "Agg"
 from evo.tools import plot
 from evo.tools.plot import PlotMode
-from evo.tools.settings import SETTINGS
-import matplotlib
-matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 

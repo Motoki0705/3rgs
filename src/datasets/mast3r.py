@@ -7,7 +7,6 @@ import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
-from pycolmap import SceneManager
 from plyfile import PlyData, PlyElement
 from PIL import Image
 import tqdm
@@ -19,7 +18,6 @@ from .normalize import (
     transform_points,
 )
 import evo.core.geometry as geometry
-
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []
@@ -129,6 +127,16 @@ class Parser:
 
 
         self.image_paths = [os.path.join(data_dir, 'images' + image_dir_suffix, file) for file in filelist]  # List[str], (num_images,)
+        self.court_mask_paths = {}
+        mask_dir = os.path.join(data_dir, "annotations", f"court_masks_factor{factor}")
+        if os.path.exists(mask_dir):
+            for file in filelist:
+                candidate = os.path.join(mask_dir, file)
+                if os.path.exists(candidate):
+                    self.court_mask_paths[file] = candidate
+        self.court_line_masks_train_fullres = None
+        self.court_line_masks_train = {}
+        self.train_split_to_mask_idx = {}
 
         # handle factor
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
@@ -137,6 +145,31 @@ class Parser:
         self.intrinsics[:,:2,:] /= factor_intr
         self.image_size = (actual_width, actual_height)
         self.factor_intr = factor_intr
+
+        court_line_masks_path = os.path.join(dust_dir, "court_line_masks.npy")
+        if os.path.exists(court_line_masks_path):
+            self.court_line_masks_train_fullres = np.load(court_line_masks_path, mmap_mode="r")
+            if self.court_line_masks_train_fullres.shape[0] != len(self.train_split):
+                raise ValueError(
+                    f"court_line_masks.npy length {self.court_line_masks_train_fullres.shape[0]} "
+                    f"does not match images_train.txt length {len(self.train_split)}."
+                )
+
+            fullres_image = imageio.imread(os.path.join(data_dir, "images", filelist[0]))[..., :3]
+            fullres_height, fullres_width = fullres_image.shape[:2]
+            if self.court_line_masks_train_fullres.shape[1:] != (fullres_height, fullres_width):
+                raise ValueError(
+                    "court_line_masks.npy spatial size "
+                    f"{self.court_line_masks_train_fullres.shape[1:]} does not match image size "
+                    f"{(fullres_height, fullres_width)}."
+                )
+
+            self.train_split_to_mask_idx = {stem: idx for idx, stem in enumerate(self.train_split)}
+            for stem, mask_idx in self.train_split_to_mask_idx.items():
+                mask = np.asarray(self.court_line_masks_train_fullres[mask_idx], dtype=np.float32)
+                if mask.shape != (actual_height, actual_width):
+                    mask = cv2.resize(mask, (actual_width, actual_height), interpolation=cv2.INTER_AREA)
+                self.court_line_masks_train[stem] = np.clip(mask, 0.0, 1.0).astype(np.float32, copy=False)
 
         # Normalize the world space.
         if normalize:
@@ -157,27 +190,6 @@ class Parser:
         self.camera_ids = [i + 1 for i in range(camtoworlds.shape[0])]  # List[int], (num_images,)
         self.Ks_dict = {cam_id: self.intrinsics[i] for i, cam_id in enumerate(self.camera_ids)}  # Dict of camera_id -> K
 
-        # use gt intrinsics
-        use_gt_intrinsics = True
-        if use_gt_intrinsics:
-            colmap_dir = os.path.join(data_dir, "sparse/0/")
-            print(colmap_dir)
-            if not os.path.exists(colmap_dir):
-                colmap_dir = os.path.join(data_dir, "sparse")
-            assert os.path.exists(
-                colmap_dir
-            ), f"COLMAP directory {colmap_dir} does not exist."
-            manager = SceneManager(colmap_dir)
-            manager.load_cameras()
-            camera_id = 1
-            cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
-            self.Ks_dict = {cam_id: K 
-                for i, cam_id in enumerate(self.camera_ids)
-            }            
-
         self.intrinsics[:,:,:] = self.Ks_dict[1]
         self.params_dict = {cam_id: [] for cam_id in self.camera_ids}  # Dict of camera_id -> params
         self.imsize_dict = {camera_id: Image.open(image_path).size for camera_id, image_path in
@@ -190,6 +202,7 @@ class Parser:
 
         num_sampled = 150000
         num_points = self.points.shape[0]
+        num_sampled = min(num_sampled, num_points)
         pt_indices = np.random.choice(num_points, size=num_sampled, replace=False)
         self.points_sampled = self.points[pt_indices]
         self.points_rgb_sampled = self.points_rgb[pt_indices]
@@ -281,6 +294,9 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         camtoworlds_gt = self.parser.camtoworlds_gt[index]
         mask = self.parser.mask_dict[camera_id]
+        court_mask_path = self.parser.court_mask_paths.get(self.parser.image_names[index])
+        image_stem = os.path.splitext(self.parser.image_names[index])[0]
+        court_line_mask = self.parser.court_line_masks_train.get(image_stem)
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -298,6 +314,8 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            if court_line_mask is not None:
+                court_line_mask = court_line_mask[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -310,6 +328,13 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if court_mask_path is not None:
+            court_mask = imageio.imread(court_mask_path)
+            if court_mask.ndim == 3:
+                court_mask = court_mask[..., 0]
+            data["court_mask"] = torch.from_numpy((court_mask > 0).astype(np.float32))
+        if court_line_mask is not None:
+            data["court_line_mask"] = torch.from_numpy(np.ascontiguousarray(court_line_mask)).float()
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -359,6 +384,11 @@ class CorrespondenceDataset():
         self.corr_batch_idx = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_batch_idx.npy')))
         self.corr_mask = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_mask.npy')))
         self.corr_weight = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_weight.npy')))
+        corr_is_manual_path = os.path.join(data_dir, 'corr_is_manual.npy')
+        if os.path.exists(corr_is_manual_path):
+            self.corr_is_manual = torch.from_numpy(np.load(corr_is_manual_path))
+        else:
+            self.corr_is_manual = torch.zeros_like(self.corr_weight)
         self.ei = torch.from_numpy(np.load(os.path.join(data_dir, 'ei.npy')))
         self.ej = torch.from_numpy(np.load(os.path.join(data_dir, 'ej.npy')))
         self.depthmaps = torch.from_numpy(np.load(os.path.join(data_dir, 'depthmaps.npy')))
@@ -378,6 +408,7 @@ class CorrespondenceDataset():
         self.corr_i = self.corr_i[::pairs_step,::cores_step]
         self.corr_j = self.corr_j[::pairs_step,::cores_step]
         self.corr_weight = self.corr_weight[::pairs_step,::cores_step]
+        self.corr_is_manual = self.corr_is_manual[::pairs_step,::cores_step]
         self.corr_mask = self.corr_mask[::pairs_step,::cores_step]
         self.corr_batch_idx = self.corr_batch_idx[:len(self.ei),::cores_step]
         
@@ -387,6 +418,7 @@ class CorrespondenceDataset():
         assert len(self.corr_batch_idx) == self.length
         assert len(self.corr_mask) == self.length
         assert len(self.corr_weight) == self.length
+        assert len(self.corr_is_manual) == self.length
         assert len(self.ei) == self.length
         assert len(self.ej) == self.length
 
@@ -467,6 +499,7 @@ class CorrespondenceDataset():
             'ej_all': self.ej,
             'corr_mask_all': self.corr_mask,
             'corr_weight_all': self.corr_weight,
+            'corr_is_manual_all': self.corr_is_manual,
             'corr_points_i_all': self.corr_points_i,
             'corr_points_j_all': self.corr_points_j,
         }
@@ -510,6 +543,7 @@ class CorrespondenceDataset():
             'corr_batch_idx': self.corr_batch_idx[0].reshape(1, -1),  # batch_size = 1
             'corr_mask': self.corr_mask[idx].reshape(1, -1),  
             'corr_weight': self.corr_weight[idx].reshape(1, -1),  
+            'corr_is_manual': self.corr_is_manual[idx].reshape(1, -1),
             'ei': self.ei[idx],  
             'ej': self.ej[idx],
             'depthmaps': torch.stack([self.depthmaps[self.ei[idx]], self.depthmaps[self.ej[idx]]])

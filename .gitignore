@@ -39,6 +39,14 @@ venv.bak/
 # Project specific
 data/
 results/
+!third_party/
+!third_party/mast3r/
+
+# Local generated scene metadata
+data_tennis_court
+data_tennis_court_pkgtest
+third_party/mast3r/.venv/
+third_party/mast3r/results/
 
 # Jupyter Notebook
 .ipynb_checkpoints

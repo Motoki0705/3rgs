@@ -28,7 +28,10 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from fused_ssim import fused_ssim
+try:
+    from fused_ssim import fused_ssim as fused_ssim_fn
+except ImportError:
+    fused_ssim_fn = None
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
@@ -82,6 +85,8 @@ class Config:
     disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Path to checkpoint files used to resume training.
+    resume_ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
@@ -135,6 +140,12 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Enable extra weighting on court-line pixels in the RGB loss.
+    use_court_line_weighted_loss: bool = False
+    # Additional weight applied on court-line pixels after warmup.
+    court_line_loss_boost: float = 4.0
+    # Linearly ramp the court-line weighting over this many steps.
+    court_line_loss_warmup_steps: int = 1000
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -340,6 +351,11 @@ class Runner:
         )
         self.trainvalset = Dataset(self.parser, split="train")
         self.valset = Dataset(self.parser, split="val", verbose=True)
+        if cfg.use_court_line_weighted_loss and self.parser.court_line_masks_train_fullres is None:
+            raise FileNotFoundError(
+                f"court_line_masks.npy not found under {self.parser.dust_dir}, "
+                "but use_court_line_weighted_loss=True."
+            )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -656,6 +672,14 @@ class Runner:
                 )
             )
 
+        if cfg.resume_ckpt is not None:
+            init_step = self.load_train_checkpoint(schedulers) + 1
+            if init_step >= max_steps:
+                raise ValueError(
+                    f"resume step {init_step} is already beyond max_steps={max_steps}."
+                )
+            print(f"Resuming training from step {init_step}")
+
 
         # trainloader
         trainloader = torch.utils.data.DataLoader(
@@ -713,6 +737,11 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            court_line_mask = (
+                data["court_line_mask"].to(device)
+                if "court_line_mask" in data
+                else None
+            )
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -780,11 +809,34 @@ class Runner:
                 info=info,
             )
 
-
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            l1loss_unweighted = F.l1_loss(colors, pixels)
+            court_line_weight_mean = torch.tensor(1.0, device=self.device)
+            court_line_mask_mean = torch.tensor(0.0, device=self.device)
+            court_line_ramp = torch.tensor(0.0, device=self.device)
+            if cfg.use_court_line_weighted_loss:
+                if court_line_mask is None:
+                    raise RuntimeError(
+                        "court_line_mask is required when use_court_line_weighted_loss=True."
+                    )
+                l1loss, court_line_weight_mean, court_line_mask_mean, court_line_ramp = (
+                    compute_weighted_l1_loss(
+                        colors=colors,
+                        pixels=pixels,
+                        valid_mask=masks,
+                        court_line_mask=court_line_mask,
+                        boost=cfg.court_line_loss_boost,
+                        warmup_steps=cfg.court_line_loss_warmup_steps,
+                        step=step,
+                    )
+                )
+            else:
+                l1loss = l1loss_unweighted
+            colors_p = colors.permute(0, 3, 1, 2)
+            pixels_p = pixels.permute(0, 3, 1, 2)
+            if fused_ssim_fn is not None:
+                ssimloss = 1.0 - fused_ssim_fn(colors_p, pixels_p, padding="valid")
+            else:
+                ssimloss = 1.0 - self.ssim(colors_p, pixels_p)
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -862,6 +914,8 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            if cfg.use_court_line_weighted_loss:
+                desc += f"weighted l1={l1loss.item():.6f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -876,6 +930,11 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                if cfg.use_court_line_weighted_loss:
+                    self.writer.add_scalar("train/l1loss_unweighted", l1loss_unweighted.item(), step)
+                    self.writer.add_scalar("train/court_line_weight_mean", court_line_weight_mean.item(), step)
+                    self.writer.add_scalar("train/court_line_mask_mean", court_line_mask_mean.item(), step)
+                    self.writer.add_scalar("train/court_line_ramp", court_line_ramp.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
@@ -903,17 +962,46 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                    "optimizers": {
+                        name: optimizer.state_dict()
+                        for name, optimizer in self.optimizers.items()
+                    },
+                    "pose_optimizers": [
+                        optimizer.state_dict() for optimizer in self.pose_optimizers
+                    ],
+                    "intrinsics_optimizers": [
+                        optimizer.state_dict()
+                        for optimizer in self.intrinsics_optimizers
+                    ],
+                    "app_optimizers": [
+                        optimizer.state_dict() for optimizer in self.app_optimizers
+                    ],
+                    "bil_grid_optimizers": [
+                        optimizer.state_dict() for optimizer in self.bil_grid_optimizers
+                    ],
+                    "schedulers": [
+                        scheduler.state_dict() for scheduler in schedulers
+                    ],
+                    "strategy_state": self.strategy_state,
+                }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
+                if cfg.intrinsics_opt:
+                    data["focal_opt"] = self.focal_opt.detach().cpu()
+                    data["pp_opt"] = self.pp_opt.detach().cpu()
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.use_bilateral_grid:
+                    data["bil_grids"] = self.bil_grids.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1353,6 +1441,54 @@ class Runner:
         
         # Log to tensorboard every step
         self.writer.add_scalar('train/epipolar_loss', lepipolar.item(), step)
+
+    def load_train_checkpoint(self, schedulers: List[torch.optim.lr_scheduler._LRScheduler]) -> int:
+        ckpts = [
+            torch.load(file, map_location=self.device, weights_only=False)
+            for file in self.cfg.resume_ckpt
+        ]
+        for k in self.splats.keys():
+            self.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+
+        ckpt0 = ckpts[0]
+        if "optimizers" in ckpt0:
+            for name, optimizer in self.optimizers.items():
+                if name in ckpt0["optimizers"]:
+                    optimizer.load_state_dict(ckpt0["optimizers"][name])
+        for optimizer, state in zip(self.pose_optimizers, ckpt0.get("pose_optimizers", [])):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(
+            self.intrinsics_optimizers, ckpt0.get("intrinsics_optimizers", [])
+        ):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(self.app_optimizers, ckpt0.get("app_optimizers", [])):
+            optimizer.load_state_dict(state)
+        for optimizer, state in zip(
+            self.bil_grid_optimizers, ckpt0.get("bil_grid_optimizers", [])
+        ):
+            optimizer.load_state_dict(state)
+        for scheduler, state in zip(schedulers, ckpt0.get("schedulers", [])):
+            scheduler.load_state_dict(state)
+        if "strategy_state" in ckpt0:
+            self.strategy_state = ckpt0["strategy_state"]
+        if self.cfg.pose_opt and "pose_adjust" in ckpt0:
+            if self.world_size > 1:
+                self.pose_adjust.module.load_state_dict(ckpt0["pose_adjust"])
+            else:
+                self.pose_adjust.load_state_dict(ckpt0["pose_adjust"])
+        if self.cfg.intrinsics_opt:
+            if "focal_opt" in ckpt0:
+                self.focal_opt.data.copy_(ckpt0["focal_opt"].to(self.device))
+            if "pp_opt" in ckpt0:
+                self.pp_opt.data.copy_(ckpt0["pp_opt"].to(self.device))
+        if self.cfg.app_opt and "app_module" in ckpt0:
+            if self.world_size > 1:
+                self.app_module.module.load_state_dict(ckpt0["app_module"])
+            else:
+                self.app_module.load_state_dict(ckpt0["app_module"])
+        if self.cfg.use_bilateral_grid and "bil_grids" in ckpt0:
+            self.bil_grids.load_state_dict(ckpt0["bil_grids"])
+        return ckpt0["step"]
         
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
@@ -1366,7 +1502,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if cfg.ckpt is not None:
         # run eval only
         ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
+            torch.load(file, map_location=runner.device, weights_only=False)
             for file in cfg.ckpt
         ]
         for k in runner.splats.keys():
@@ -1395,6 +1531,43 @@ def smoothl1_dist(a, b, weight, beta=1.0):
         diff - 0.5 * beta
     )
     return smooth_l1 * weight
+
+
+def compute_weighted_l1_loss(
+    colors: Tensor,
+    pixels: Tensor,
+    valid_mask: Optional[Tensor],
+    court_line_mask: Tensor,
+    boost: float,
+    warmup_steps: int,
+    step: int,
+    eps: float = 1e-8,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    per_pixel_l1 = torch.abs(colors - pixels).mean(dim=-1)
+    if valid_mask is None:
+        base_valid = torch.ones_like(per_pixel_l1)
+    else:
+        base_valid = valid_mask.float()
+    if court_line_mask.shape != per_pixel_l1.shape:
+        raise ValueError(
+            f"court_line_mask shape {court_line_mask.shape} does not match RGB loss shape {per_pixel_l1.shape}."
+        )
+
+    if warmup_steps <= 0:
+        ramp = 1.0
+    else:
+        ramp = min(float(step) / float(warmup_steps), 1.0)
+    ramp_t = torch.tensor(ramp, dtype=per_pixel_l1.dtype, device=per_pixel_l1.device)
+
+    court_line_mask = court_line_mask.to(dtype=per_pixel_l1.dtype)
+    weight_map = base_valid * (1.0 + boost * ramp_t * court_line_mask)
+    weight_denom = weight_map.sum().clamp_min(eps)
+    valid_denom = base_valid.sum().clamp_min(eps)
+
+    loss = (per_pixel_l1 * weight_map).sum() / weight_denom
+    weight_mean = weight_map.sum() / valid_denom
+    court_line_mask_mean = (court_line_mask * base_valid).sum() / valid_denom
+    return loss, weight_mean, court_line_mask_mean, ramp_t
 
 def compute_gradient_loss(pixels, colors, edge_threshold=4, rgb_boundary_threshold=0.01):
     """
