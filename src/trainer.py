@@ -140,6 +140,12 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Enable extra weighting on court-line pixels in the RGB loss.
+    use_court_line_weighted_loss: bool = False
+    # Additional weight applied on court-line pixels after warmup.
+    court_line_loss_boost: float = 4.0
+    # Linearly ramp the court-line weighting over this many steps.
+    court_line_loss_warmup_steps: int = 1000
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -345,6 +351,11 @@ class Runner:
         )
         self.trainvalset = Dataset(self.parser, split="train")
         self.valset = Dataset(self.parser, split="val", verbose=True)
+        if cfg.use_court_line_weighted_loss and self.parser.court_line_masks_train_fullres is None:
+            raise FileNotFoundError(
+                f"court_line_masks.npy not found under {self.parser.dust_dir}, "
+                "but use_court_line_weighted_loss=True."
+            )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -726,6 +737,11 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            court_line_mask = (
+                data["court_line_mask"].to(device)
+                if "court_line_mask" in data
+                else None
+            )
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -793,8 +809,28 @@ class Runner:
                 info=info,
             )
 
-
-            l1loss = F.l1_loss(colors, pixels)
+            l1loss_unweighted = F.l1_loss(colors, pixels)
+            court_line_weight_mean = torch.tensor(1.0, device=self.device)
+            court_line_mask_mean = torch.tensor(0.0, device=self.device)
+            court_line_ramp = torch.tensor(0.0, device=self.device)
+            if cfg.use_court_line_weighted_loss:
+                if court_line_mask is None:
+                    raise RuntimeError(
+                        "court_line_mask is required when use_court_line_weighted_loss=True."
+                    )
+                l1loss, court_line_weight_mean, court_line_mask_mean, court_line_ramp = (
+                    compute_weighted_l1_loss(
+                        colors=colors,
+                        pixels=pixels,
+                        valid_mask=masks,
+                        court_line_mask=court_line_mask,
+                        boost=cfg.court_line_loss_boost,
+                        warmup_steps=cfg.court_line_loss_warmup_steps,
+                        step=step,
+                    )
+                )
+            else:
+                l1loss = l1loss_unweighted
             colors_p = colors.permute(0, 3, 1, 2)
             pixels_p = pixels.permute(0, 3, 1, 2)
             if fused_ssim_fn is not None:
@@ -878,6 +914,8 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            if cfg.use_court_line_weighted_loss:
+                desc += f"weighted l1={l1loss.item():.6f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -892,6 +930,11 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                if cfg.use_court_line_weighted_loss:
+                    self.writer.add_scalar("train/l1loss_unweighted", l1loss_unweighted.item(), step)
+                    self.writer.add_scalar("train/court_line_weight_mean", court_line_weight_mean.item(), step)
+                    self.writer.add_scalar("train/court_line_mask_mean", court_line_mask_mean.item(), step)
+                    self.writer.add_scalar("train/court_line_ramp", court_line_ramp.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
@@ -1488,6 +1531,43 @@ def smoothl1_dist(a, b, weight, beta=1.0):
         diff - 0.5 * beta
     )
     return smooth_l1 * weight
+
+
+def compute_weighted_l1_loss(
+    colors: Tensor,
+    pixels: Tensor,
+    valid_mask: Optional[Tensor],
+    court_line_mask: Tensor,
+    boost: float,
+    warmup_steps: int,
+    step: int,
+    eps: float = 1e-8,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    per_pixel_l1 = torch.abs(colors - pixels).mean(dim=-1)
+    if valid_mask is None:
+        base_valid = torch.ones_like(per_pixel_l1)
+    else:
+        base_valid = valid_mask.float()
+    if court_line_mask.shape != per_pixel_l1.shape:
+        raise ValueError(
+            f"court_line_mask shape {court_line_mask.shape} does not match RGB loss shape {per_pixel_l1.shape}."
+        )
+
+    if warmup_steps <= 0:
+        ramp = 1.0
+    else:
+        ramp = min(float(step) / float(warmup_steps), 1.0)
+    ramp_t = torch.tensor(ramp, dtype=per_pixel_l1.dtype, device=per_pixel_l1.device)
+
+    court_line_mask = court_line_mask.to(dtype=per_pixel_l1.dtype)
+    weight_map = base_valid * (1.0 + boost * ramp_t * court_line_mask)
+    weight_denom = weight_map.sum().clamp_min(eps)
+    valid_denom = base_valid.sum().clamp_min(eps)
+
+    loss = (per_pixel_l1 * weight_map).sum() / weight_denom
+    weight_mean = weight_map.sum() / valid_denom
+    court_line_mask_mean = (court_line_mask * base_valid).sum() / valid_denom
+    return loss, weight_mean, court_line_mask_mean, ramp_t
 
 def compute_gradient_loss(pixels, colors, edge_threshold=4, rgb_boundary_threshold=0.01):
     """

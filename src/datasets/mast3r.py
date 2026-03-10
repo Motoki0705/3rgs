@@ -134,6 +134,9 @@ class Parser:
                 candidate = os.path.join(mask_dir, file)
                 if os.path.exists(candidate):
                     self.court_mask_paths[file] = candidate
+        self.court_line_masks_train_fullres = None
+        self.court_line_masks_train = {}
+        self.train_split_to_mask_idx = {}
 
         # handle factor
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
@@ -142,6 +145,31 @@ class Parser:
         self.intrinsics[:,:2,:] /= factor_intr
         self.image_size = (actual_width, actual_height)
         self.factor_intr = factor_intr
+
+        court_line_masks_path = os.path.join(dust_dir, "court_line_masks.npy")
+        if os.path.exists(court_line_masks_path):
+            self.court_line_masks_train_fullres = np.load(court_line_masks_path, mmap_mode="r")
+            if self.court_line_masks_train_fullres.shape[0] != len(self.train_split):
+                raise ValueError(
+                    f"court_line_masks.npy length {self.court_line_masks_train_fullres.shape[0]} "
+                    f"does not match images_train.txt length {len(self.train_split)}."
+                )
+
+            fullres_image = imageio.imread(os.path.join(data_dir, "images", filelist[0]))[..., :3]
+            fullres_height, fullres_width = fullres_image.shape[:2]
+            if self.court_line_masks_train_fullres.shape[1:] != (fullres_height, fullres_width):
+                raise ValueError(
+                    "court_line_masks.npy spatial size "
+                    f"{self.court_line_masks_train_fullres.shape[1:]} does not match image size "
+                    f"{(fullres_height, fullres_width)}."
+                )
+
+            self.train_split_to_mask_idx = {stem: idx for idx, stem in enumerate(self.train_split)}
+            for stem, mask_idx in self.train_split_to_mask_idx.items():
+                mask = np.asarray(self.court_line_masks_train_fullres[mask_idx], dtype=np.float32)
+                if mask.shape != (actual_height, actual_width):
+                    mask = cv2.resize(mask, (actual_width, actual_height), interpolation=cv2.INTER_AREA)
+                self.court_line_masks_train[stem] = np.clip(mask, 0.0, 1.0).astype(np.float32, copy=False)
 
         # Normalize the world space.
         if normalize:
@@ -267,6 +295,8 @@ class Dataset:
         camtoworlds_gt = self.parser.camtoworlds_gt[index]
         mask = self.parser.mask_dict[camera_id]
         court_mask_path = self.parser.court_mask_paths.get(self.parser.image_names[index])
+        image_stem = os.path.splitext(self.parser.image_names[index])[0]
+        court_line_mask = self.parser.court_line_masks_train.get(image_stem)
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -284,6 +314,8 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            if court_line_mask is not None:
+                court_line_mask = court_line_mask[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -301,6 +333,8 @@ class Dataset:
             if court_mask.ndim == 3:
                 court_mask = court_mask[..., 0]
             data["court_mask"] = torch.from_numpy((court_mask > 0).astype(np.float32))
+        if court_line_mask is not None:
+            data["court_line_mask"] = torch.from_numpy(np.ascontiguousarray(court_line_mask)).float()
 
         if self.load_depths:
             # projected points to image plane to get depths
