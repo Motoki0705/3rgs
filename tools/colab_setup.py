@@ -34,7 +34,6 @@ PHASES = [
     "copy_tar",
     "extract_tar",
     "prepare_scene",
-    "prepare_epipolar",
     "verify_runtime",
     "train",
 ]
@@ -342,18 +341,6 @@ def main() -> None:
             )
     elif end_idx >= PHASES.index("prepare_scene") and scene_root is not None:
         data_link = ensure_repo_link(repo_dir, scene_root, args.repo_data_link_name)
-
-    if should_run("prepare_epipolar"):
-        if data_link is None:
-            raise RuntimeError("Data link is unavailable. Run prepare_scene first.")
-        enter_phase("prepare_epipolar", "verifying epipolar tensors produced by preprocess.py")
-        if has_prepared_epipolar(scene_root or data_link):
-            print(f"Found packaged epipolar tensors under {scene_root or data_link}", flush=True)
-        else:
-            raise RuntimeError(
-                "Epipolar tensors are missing after preprocess.py. "
-                "Expected preprocess.py to package corr_*.npy and ei/ej.npy under mast3r/."
-            )
 
     if should_run("verify_runtime"):
         enter_phase("verify_runtime", "verifying torch, CUDA, and package imports")
