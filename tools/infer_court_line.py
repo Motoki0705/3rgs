@@ -10,6 +10,10 @@ Preprocessing matches `experiments/court_detection/configs/line.py` validation:
 Outputs are written under the requested output directory:
 - `masks/<stem>.png`: binary mask at the original image resolution
 - `manifest.json`: run metadata
+
+If a scene directory is provided, the script also writes:
+- `mast3r/court_line_masks.npy`: cleaned train-split masks stacked in
+  `images_train.txt` order
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from numpy.lib.format import open_memmap
 
 
 TENNIS_LAB_ROOT = Path("/root/repos/tennis-lab")
@@ -47,6 +52,8 @@ class InferenceConfig:
     image_dir: Path
     checkpoint: Path
     output_dir: Path
+    scene_dir: Path | None = None
+    mast3r_output_path: Path | None = None
     batch_size: int = 32
     short_side: int = 288
     threshold: float = 0.5
@@ -74,6 +81,18 @@ def parse_args() -> InferenceConfig:
         type=Path,
         default=Path("/root/repos/3rgs/results"),
     )
+    parser.add_argument(
+        "--scene-dir",
+        type=Path,
+        default=Path("/root/repos/3rgs/data/tennis_court"),
+        help="Scene root containing images_train.txt and mast3r/.",
+    )
+    parser.add_argument(
+        "--mast3r-output-path",
+        type=Path,
+        default=None,
+        help="Override the .npy output path. Defaults to <scene-dir>/mast3r/court_line_masks.npy.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--short-side", type=int, default=288)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -91,6 +110,12 @@ def parse_args() -> InferenceConfig:
         image_dir=args.image_dir.expanduser().resolve(),
         checkpoint=args.checkpoint.expanduser().resolve(),
         output_dir=args.output_dir.expanduser().resolve(),
+        scene_dir=args.scene_dir.expanduser().resolve() if args.scene_dir is not None else None,
+        mast3r_output_path=(
+            args.mast3r_output_path.expanduser().resolve()
+            if args.mast3r_output_path is not None
+            else None
+        ),
         batch_size=args.batch_size,
         short_side=args.short_side,
         threshold=args.threshold,
@@ -237,9 +262,36 @@ def write_mask(mask: np.ndarray, output_path: Path) -> None:
         raise RuntimeError(f"Failed to write output: {output_path}")
 
 
+def clean_upper_half(mask: np.ndarray) -> np.ndarray:
+    cleaned = mask.copy()
+    cleaned[: cleaned.shape[0] // 2, :] = 0
+    return cleaned
+
+
+def resolve_mast3r_output_path(cfg: InferenceConfig) -> Path | None:
+    if cfg.mast3r_output_path is not None:
+        return cfg.mast3r_output_path
+    if cfg.scene_dir is None:
+        return None
+    return cfg.scene_dir / "mast3r" / "court_line_masks.npy"
+
+
+def load_train_split(scene_dir: Path) -> list[str]:
+    train_split_path = scene_dir / "images_train.txt"
+    if not train_split_path.exists():
+        raise FileNotFoundError(f"Train split file not found: {train_split_path}")
+    return [
+        line.strip()
+        for line in train_split_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def main() -> None:
     cfg = parse_args()
     device = resolve_device(cfg.device)
+    mast3r_output_path = resolve_mast3r_output_path(cfg)
+    train_split = load_train_split(cfg.scene_dir) if cfg.scene_dir is not None else []
 
     dataset = CourtLineInferenceDataset(cfg.image_dir, cfg.short_side)
     pin_memory = device.type == "cuda"
@@ -273,6 +325,10 @@ def main() -> None:
     output_mask_dir.mkdir(parents=True, exist_ok=True)
     futures: list[Future[None]] = []
     manifest_items: list[dict[str, Any]] = []
+    train_split_index = {image_id: idx for idx, image_id in enumerate(train_split)}
+    train_mask_memmap: np.memmap | None = None
+    train_mask_shape: tuple[int, int] | None = None
+    train_written = np.zeros((len(train_split),), dtype=bool) if train_split else None
 
     use_amp = device.type == "cuda"
     with ThreadPoolExecutor(max_workers=cfg.save_workers) as pool, torch.inference_mode():
@@ -297,8 +353,28 @@ def main() -> None:
                     align_corners=False,
                 ).squeeze().cpu().numpy()
                 mask = (prob >= cfg.threshold).astype(np.uint8) * 255
+                mask = clean_upper_half(mask)
                 output_path = output_mask_dir / f"{image_id}.png"
                 futures.append(pool.submit(write_mask, mask, output_path))
+                if image_id in train_split_index:
+                    binary_mask = (mask > 0).astype(np.uint8)
+                    if train_mask_memmap is None:
+                        train_mask_shape = binary_mask.shape
+                        if mast3r_output_path is None:
+                            raise RuntimeError("Internal error: missing mast3r output path for train-split export.")
+                        mast3r_output_path.parent.mkdir(parents=True, exist_ok=True)
+                        train_mask_memmap = open_memmap(
+                            mast3r_output_path,
+                            mode="w+",
+                            dtype=np.uint8,
+                            shape=(len(train_split), train_mask_shape[0], train_mask_shape[1]),
+                        )
+                    if binary_mask.shape != train_mask_shape:
+                        raise RuntimeError("Train-split mask sizes are inconsistent; cannot write a single .npy array.")
+                    split_idx = train_split_index[image_id]
+                    train_mask_memmap[split_idx] = binary_mask
+                    if train_written is not None:
+                        train_written[split_idx] = True
                 manifest_items.append(
                     {
                         "image_id": image_id,
@@ -306,11 +382,24 @@ def main() -> None:
                         "mask_path": str(output_path),
                         "orig_size": [orig_h, orig_w],
                         "infer_size": [infer_h, infer_w],
+                        "upper_half_cleaned": True,
                     }
                 )
 
         for future in futures:
             future.result()
+
+    if mast3r_output_path is not None:
+        if train_written is None or train_mask_memmap is None:
+            raise RuntimeError("No train-split masks were written.")
+        missing = [image_id for idx, image_id in enumerate(train_split) if not train_written[idx]]
+        if missing:
+            raise RuntimeError(
+                "Missing masks for train split images: "
+                + ", ".join(missing[:10])
+                + (" ..." if len(missing) > 10 else "")
+            )
+        train_mask_memmap.flush()
 
     manifest = {
         "requested_checkpoint": str(cfg.checkpoint),
@@ -319,7 +408,11 @@ def main() -> None:
         "batch_size": cfg.batch_size,
         "short_side": cfg.short_side,
         "threshold": cfg.threshold,
+        "upper_half_cleaned": True,
         "num_images": len(dataset),
+        "scene_dir": str(cfg.scene_dir) if cfg.scene_dir is not None else None,
+        "mast3r_output_path": str(mast3r_output_path) if mast3r_output_path is not None else None,
+        "train_split_count": len(train_split),
         "items": manifest_items,
     }
     manifest_path = cfg.output_dir / "manifest.json"
@@ -327,6 +420,8 @@ def main() -> None:
 
     print(f"Inference complete: {len(dataset)} images")
     print(f"Masks: {output_mask_dir}")
+    if mast3r_output_path is not None:
+        print(f"MASt3R masks: {mast3r_output_path}")
     print(f"Manifest: {manifest_path}")
 
 
