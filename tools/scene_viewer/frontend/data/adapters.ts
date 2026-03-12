@@ -142,7 +142,13 @@ export function courtResultAdapter(raw: any): CourtResultViewModel {
       keypointsCourt: raw.court_keypoints_court,
       skeleton: raw.court_skeleton,
     },
-    courtPair: rawCourtPair,
+    courtPair: {
+      ...rawCourtPair,
+      adjacentCenterOffset:
+        rawCourtPair.adjacentCenterOffset ?? rawCourtPair.adjacent_center_offset,
+      adjacentDirectionVector:
+        rawCourtPair.adjacentDirectionVector ?? rawCourtPair.adjacent_direction_vector,
+    },
     metrics,
   };
 }

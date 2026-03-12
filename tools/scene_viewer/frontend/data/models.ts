@@ -61,6 +61,8 @@ export interface MetricsModel {
 export interface CourtPairModel {
   adjacentCenterOffset?: number;
   adjacentDirectionVector?: number[];
+  adjacent_center_offset?: number;
+  adjacent_direction_vector?: number[];
   [key: string]: unknown;
 }
 

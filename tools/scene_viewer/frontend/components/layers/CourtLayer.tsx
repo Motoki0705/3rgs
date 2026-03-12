@@ -60,8 +60,8 @@ export const CourtLayer: React.FC<CourtLayerProps> = ({
     // Court 2
     let adjOffset: number[];
     if (useMatrix && courtPair) {
-      const off = courtPair.adjacentCenterOffset ?? 0;
-      const vec = courtPair.adjacentDirectionVector ?? [1, 0, 0];
+      const off = courtPair.adjacentCenterOffset ?? courtPair.adjacent_center_offset ?? 0;
+      const vec = courtPair.adjacentDirectionVector ?? courtPair.adjacent_direction_vector ?? [1, 0, 0];
       adjOffset = [off * vec[0], off * vec[1], off * vec[2]];
     } else {
       const adjDirVec = ADJ_DIRS[adjacentDirection] ?? [1, 0, 0];

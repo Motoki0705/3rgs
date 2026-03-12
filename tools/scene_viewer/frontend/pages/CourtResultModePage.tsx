@@ -59,8 +59,8 @@ export const CourtResultModePage: React.FC = () => {
 
     const kpWorld1 = courtToWorldMatrix(keypointsCourt, matrix);
 
-    const off = courtPair.adjacentCenterOffset ?? 0;
-    const vec = courtPair.adjacentDirectionVector ?? [1, 0, 0];
+    const off = courtPair.adjacentCenterOffset ?? courtPair.adjacent_center_offset ?? 0;
+    const vec = courtPair.adjacentDirectionVector ?? courtPair.adjacent_direction_vector ?? [1, 0, 0];
     const adjOffset = [off * vec[0], off * vec[1], off * vec[2]];
     const kpCourt2 = offsetKeypoints(keypointsCourt, adjOffset);
     const kpWorld2 = courtToWorldMatrix(kpCourt2, matrix);
