@@ -13,6 +13,13 @@ interface AutoFitControllerProps {
   onFit?: (radius: number) => void;
 }
 
+function percentile(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * q)));
+  return sorted[idx];
+}
+
 export const AutoFitController: React.FC<AutoFitControllerProps> = ({
   pointCloud,
   cameras,
@@ -49,6 +56,31 @@ export const AutoFitController: React.FC<AutoFitControllerProps> = ({
     }
     maxDist = Math.max(maxDist, 3);
 
+    // Navigation speed should follow the playable region, not far outlier points.
+    // Use a robust camera-spread radius when possible, and only fall back to a
+    // point-cloud percentile when camera coverage is unavailable.
+    let navigationRadius = 0;
+    if (cameras.length > 0) {
+      const cameraDistances = cameras.map((cam) => {
+        const dx = cam.c2w[0][3] - center.x;
+        const dy = cam.c2w[1][3] - center.y;
+        const dz = cam.c2w[2][3] - center.z;
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+      });
+      navigationRadius = percentile(cameraDistances, 0.8);
+    } else if (pointCloud.count > 0) {
+      const pointDistances: number[] = [];
+      const step = Math.max(1, Math.floor(pointCloud.count / 5000));
+      for (let i = 0; i < pointCloud.count; i += step) {
+        const dx = pos[i * 3] - center.x;
+        const dy = pos[i * 3 + 1] - center.y;
+        const dz = pos[i * 3 + 2] - center.z;
+        pointDistances.push(Math.sqrt(dx * dx + dy * dy + dz * dz));
+      }
+      navigationRadius = percentile(pointDistances, 0.7);
+    }
+    navigationRadius = Math.max(navigationRadius, 1.5);
+
     if (zUp) {
       camera.position.set(
         center.x,
@@ -72,7 +104,7 @@ export const AutoFitController: React.FC<AutoFitControllerProps> = ({
       camera.rotation.x = pitch;
     }
 
-    onFit?.(maxDist);
+    onFit?.(navigationRadius);
   }, [camera, cameras, pointCloud, zUp, onFit]);
 
   return null;

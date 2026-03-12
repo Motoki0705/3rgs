@@ -5,15 +5,15 @@
 
 // ── Movement speed ──────────────────────────────────────────────────────────
 /** Base move speed multiplier, applied per frame to camera position. */
-export const MOVE_SPEED_MID = 0.08;
+export const MOVE_SPEED_MID = 0.04;
 
 /** Compute speed tiers from scene radius. */
 export function speedsFromRadius(radius: number) {
-  const base = Math.max(radius * 0.015, 0.02);
+  const base = Math.max(radius * 0.008, 0.012);
   return {
-    low: base * 0.5,
+    low: base,
     mid: base,
-    high: base * 2.0,
+    high: base,
   };
 }
 

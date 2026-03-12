@@ -97,21 +97,11 @@ export function useFlyNavigation(opts: FlyNavigationOptions = {}) {
         if (e.key === 'Escape') (document.activeElement as HTMLElement)?.blur();
         return;
       }
-      const key = e.key.toLowerCase();
-      s.keys[key] = true;
-      if (key === 'shift') {
-        s.moveSpeed = s.speeds.high;
-      } else if (key === 'alt') {
-        s.moveSpeed = s.speeds.low;
-      }
+      s.keys[e.key.toLowerCase()] = true;
     }
 
     function onKeyUp(e: KeyboardEvent) {
-      const key = e.key.toLowerCase();
-      s.keys[key] = false;
-      if (key === 'shift' || key === 'alt') {
-        s.moveSpeed = s.speeds.mid;
-      }
+      s.keys[e.key.toLowerCase()] = false;
     }
 
     function onContextMenu(e: Event) {
