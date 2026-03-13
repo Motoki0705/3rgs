@@ -3,10 +3,9 @@
 
 Pipeline:
 1. Project each camera's court-line mask onto the estimated ground plane.
-2. Fit a 2D two-court similarity transform to the merged weighted heatmap.
-3. Fit the same model on contiguous camera chunks and cluster the chunk poses.
-4. Rebuild a dominant-cluster heatmap, refit, and export an init_sim3.json-style
-   result that can be used as an initialization for later refinement.
+2. Fit the model on contiguous camera chunks.
+3. Cluster the chunk poses, refit on the dominant cluster, and export an
+   init_sim3.json-style result for later refinement.
 """
 from __future__ import annotations
 
@@ -625,6 +624,15 @@ def fit_single_heatmap(
         morph_close=args.morph_close,
         min_component_area=args.min_component_area,
     )
+    seeds = make_seed_params(
+        init_params["scale"],
+        init_params["theta"],
+        init_params["gap"],
+        heatmap,
+        args.adjacent_court_direction,
+    )
+    if extra_seeds:
+        seeds.extend(extra_seeds)
     fit = coordinate_descent_fit(
         heatmap,
         init_params=init_params,
@@ -641,7 +649,7 @@ def fit_single_heatmap(
         gap_step=args.search_gap_step,
         gap_min=args.search_gap_min,
         max_gap=args.max_gap,
-        extra_seeds=extra_seeds,
+        extra_seeds=seeds,
     )
     fit.stage = stage
     return heatmap, fit
@@ -910,27 +918,12 @@ def main() -> None:
     ground["mast3r_dir"] = str(mast3r_dir)
     all_uv = np.concatenate([uv for uv in projected_uvs if uv.size > 0], axis=0)
     extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
-
-    print("Fitting a single weighted heatmap over all cameras...", flush=True)
-    global_counts = build_counts_for_cameras(projected_uvs, list(range(len(projected_uvs))), extent, args.grid_resolution)
     init_params = initial_params_from_ground(ground, args.adjacent_court_direction, args.init_gap)
-    global_seeds = make_seed_params(init_params["scale"], init_params["theta"], init_params["gap"], build_weighted_heatmap(global_counts, extent, args.grid_resolution, args.weight_threshold_quantile, args.morph_open, args.morph_close, args.min_component_area), args.adjacent_court_direction)
-    global_heatmap, global_fit = fit_single_heatmap(
-        global_counts,
-        extent,
-        args.grid_resolution,
-        init_params=init_params,
-        args=args,
-        stage="global_all",
-        extra_seeds=global_seeds,
-    )
-    cv2.imwrite(str(output_dir / "global_all_overlay.png"), render_overlay(global_heatmap, global_fit, args.adjacent_court_direction, args.line_thickness_px))
-    cv2.imwrite(str(output_dir / "global_all_heatmap.png"), cv2.applyColorMap(np.clip(np.round(255.0 * global_heatmap.weights), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO))
 
     print("Running chunk-wise heatmap fits...", flush=True)
     chunk_records: list[ChunkFitRecord] = []
     chunk_images: list[Path] = []
-    previous_fit = global_fit
+    previous_fit: FitResult | None = None
     chunk_index = 0
     for start in range(0, len(projected_uvs), max(1, args.window_stride)):
         end = min(len(projected_uvs), start + max(1, args.window_size))
@@ -941,14 +934,18 @@ def main() -> None:
         projected_pixels = int(np.sum(counts, dtype=np.float64))
         if projected_pixels <= 0:
             continue
+        chunk_init = previous_fit.params if previous_fit is not None and np.isfinite(previous_fit.total_loss) else init_params
+        extra_seeds = [init_params]
+        if previous_fit is not None and np.isfinite(previous_fit.total_loss):
+            extra_seeds.append(previous_fit.params)
         chunk_heatmap, chunk_fit = fit_single_heatmap(
             counts,
             extent,
             args.grid_resolution,
-            init_params=previous_fit.params,
+            init_params=chunk_init,
             args=args,
             stage=f"chunk_{chunk_index:03d}",
-            extra_seeds=[global_fit.params],
+            extra_seeds=extra_seeds,
         )
         record = ChunkFitRecord(
             chunk_index=chunk_index,
@@ -962,8 +959,12 @@ def main() -> None:
         image_path = chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}.png"
         cv2.imwrite(str(image_path), render_overlay(chunk_heatmap, chunk_fit, args.adjacent_court_direction, args.line_thickness_px))
         chunk_images.append(image_path)
-        previous_fit = chunk_fit
+        if np.isfinite(chunk_fit.total_loss):
+            previous_fit = chunk_fit
         chunk_index += 1
+
+    if not chunk_records:
+        raise RuntimeError("No valid chunk fits were produced from the projected court-line masks.")
 
     labels, silhouette = cluster_chunk_fits(chunk_records, args)
     for record, label in zip(chunk_records, labels.tolist()):
@@ -976,12 +977,15 @@ def main() -> None:
     )
 
     if not dominant_cameras:
-        dominant_cameras = list(range(len(projected_uvs)))
+        best_chunk = min(chunk_records, key=lambda record: record.fit.total_loss)
+        dominant_label = int(best_chunk.cluster)
+        dominant_cameras = list(best_chunk.camera_indices)
 
     dominant_counts = build_counts_for_cameras(projected_uvs, dominant_cameras, extent, args.grid_resolution)
-    dominant_init = global_fit.params
+    best_chunk = min(chunk_records, key=lambda record: record.fit.total_loss)
+    dominant_init = best_chunk.fit.params
     dominant_member_records = [record for record in chunk_records if record.cluster == dominant_label]
-    extra_seeds = [global_fit.params]
+    extra_seeds = [init_params, best_chunk.fit.params]
     if dominant_member_records:
         dominant_init = weighted_mean_params(dominant_member_records)
         extra_seeds.append(dominant_member_records[np.argmin([record.fit.total_loss for record in dominant_member_records])].fit.params)
@@ -1003,10 +1007,18 @@ def main() -> None:
     selected_fit = final_fit
     selected_heatmap = dominant_heatmap
     selected_fit_source = "dominant_cluster"
-    if not np.isfinite(final_fit.total_loss) or final_fit.total_loss > global_fit.total_loss:
-        selected_fit = global_fit
-        selected_heatmap = global_heatmap
-        selected_fit_source = "global_all"
+    if not np.isfinite(final_fit.total_loss):
+        selected_fit = best_chunk.fit
+        selected_heatmap, _ = fit_single_heatmap(
+            build_counts_for_cameras(projected_uvs, best_chunk.camera_indices, extent, args.grid_resolution),
+            extent,
+            args.grid_resolution,
+            init_params=best_chunk.fit.params,
+            args=args,
+            stage="best_chunk_fallback",
+            extra_seeds=[init_params],
+        )
+        selected_fit_source = "best_chunk"
 
     cv2.imwrite(
         str(output_dir / "selected_fit_overlay.png"),
@@ -1031,7 +1043,6 @@ def main() -> None:
             "axis_x": np.asarray(ground["axis_x"], dtype=np.float64).tolist(),
             "axis_y": np.asarray(ground["axis_y"], dtype=np.float64).tolist(),
         },
-        "global_fit": asdict(global_fit),
         "dominant_cluster_fit": asdict(final_fit),
         "selected_fit_source": selected_fit_source,
         "final_fit": asdict(selected_fit),
@@ -1059,7 +1070,6 @@ def main() -> None:
 
     np.savez_compressed(
         output_dir / "heatmaps.npz",
-        global_counts=global_counts,
         dominant_counts=dominant_counts,
         extent=np.asarray(extent, dtype=np.float64),
         resolution=np.asarray(args.grid_resolution, dtype=np.float64),

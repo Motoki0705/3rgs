@@ -8,7 +8,8 @@
   各カメラのコートラインマスクを地面平面へ投影し、俯瞰画像や統計情報を保存します。
 - `fit_from_ground_heatmap.py`
   地面平面上に集約したヒートマップに対して 2 面コートのテンプレートを当てはめ、
-  chunk 単位の fit と clustering を行い、`init_sim3.json` 形式の初期値を出力します。
+  chunk 単位の fit と clustering を行い、支配的クラスタを再 fit して
+  `init_sim3.json` 形式の初期値を出力します。
 
 どちらも `tools/fit_court_sim3.py` とは独立しています。
 
@@ -55,7 +56,6 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 - `init_sim3_from_ground_heatmap.json`
 - `metadata.json`
 - `heatmaps.npz`
-- `global_all_overlay.png`
 - `dominant_cluster_overlay.png`
 - `selected_fit_overlay.png`
 - `chunk_overlays_contact_sheet.png`
@@ -71,8 +71,6 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 
 ## 出力の見方
 
-- `global_all_overlay.png`
-  全カメラをまとめたヒートマップに対する fit 結果です。
 - `dominant_cluster_overlay.png`
   chunk clustering 後に、支配的なクラスタだけで再 fit した結果です。
 - `selected_fit_overlay.png`
@@ -84,4 +82,4 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 
 - この fit は画像平面ではなく、推定された地面平面上で行います。
 - chunk clustering は、カメラポーズのドリフトの影響を減らすために入れています。
-- dominant cluster での再 fit が全体 fit より悪い場合は、自動で全体 fit にフォールバックします。
+- 再 fit に失敗した場合は、最良の chunk fit にフォールバックします。
