@@ -70,6 +70,41 @@ def install_python_deps(repo_dir: Path) -> None:
         ]
     )
     run([sys.executable, "-m", "pip", "install", "-r", str(repo_dir / "requirements.txt")])
+    ensure_mast3r_venv(repo_dir)
+
+
+def ensure_mast3r_venv(repo_dir: Path) -> Path:
+    mast3r_repo = repo_dir / "third_party" / "mast3r"
+    venv_dir = mast3r_repo / ".venv"
+    venv_python = venv_dir / "bin" / "python"
+    if not venv_python.exists():
+        print(f"Creating MASt3R venv at {venv_dir}", flush=True)
+        run([sys.executable, "-m", "venv", "--system-site-packages", str(venv_dir)], cwd=repo_dir)
+
+    run([str(venv_python), "-m", "pip", "install", "--upgrade", *DEFAULT_PYTHON_PACKAGES], cwd=repo_dir)
+    run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(mast3r_repo / "dust3r" / "requirements.txt"),
+        ],
+        cwd=repo_dir,
+    )
+    run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(mast3r_repo / "requirements.txt"),
+        ],
+        cwd=repo_dir,
+    )
+    return venv_python
 
 
 def copy_tar_to_local(src_tar: Path, local_tar: Path, overwrite: bool) -> None:
