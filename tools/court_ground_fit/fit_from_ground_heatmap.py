@@ -2,9 +2,9 @@
 """Fit a two-court template to ground-plane heatmaps derived from camera masks.
 
 Pipeline:
-1. Project each camera's court-line mask onto the estimated ground plane.
+1. Load pre-projected camera court-line masks from ``court/ground`` artifacts.
 2. Fit the model on contiguous camera chunks.
-3. Cluster the chunk poses, refit on the dominant cluster, and export an
+3. Cluster the chunk poses, refit on the dominant cluster, and export a
    final transform under ``data/.../court/transform``.
 """
 from __future__ import annotations
@@ -27,13 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from project_court_lines_to_ground import (
-    estimate_ground_frame,
-    load_train_stems,
-    project_mask_to_plane,
-    rasterize_uv,
-    scale_intrinsics_to_fullres,
-)
+from project_court_lines_to_ground import rasterize_uv
 from utils.court_scheme import COURT_SKELETON, DOUBLES_WIDTH, court_keypoints_3d
 
 
@@ -86,8 +80,7 @@ class HeatmapData:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene-dir", type=Path, default=Path("data/tennis_court"))
-    parser.add_argument("--mast3r-dir", type=Path, default=None)
-    parser.add_argument("--mask-path", type=Path, default=None)
+    parser.add_argument("--ground-dir", type=Path, default=None)
     parser.add_argument("--transform-dir", type=Path, default=None)
     parser.add_argument(
         "--output-dir",
@@ -95,13 +88,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("results/tennis_court/court/transform"),
     )
     parser.add_argument("--adjacent-court-direction", choices=("+x", "-x", "+y", "-y"), default="+x")
-    parser.add_argument("--court-base-width", type=float, default=512.0)
     parser.add_argument("--grid-resolution", type=float, default=0.04)
     parser.add_argument("--extent-margin", type=float, default=2.0)
     parser.add_argument("--extent-percentile", type=float, default=0.5)
-    parser.add_argument("--n-sample", type=int, default=50_000)
-    parser.add_argument("--ransac-iters", type=int, default=1_000)
-    parser.add_argument("--ransac-thr", type=float, default=0.05)
     parser.add_argument("--line-sample-step", type=float, default=0.08)
     parser.add_argument("--line-thickness-px", type=int, default=2)
     parser.add_argument("--weight-threshold-quantile", type=float, default=0.68)
@@ -531,52 +520,48 @@ def render_overlay(heatmap: HeatmapData, fit: FitResult, direction: str, line_th
     return overlay
 
 
-def build_camera_uvs(
-    scene_dir: Path,
-    mast3r_dir: Path,
-    mask_path: Path,
-    court_base_width: float,
-    n_sample: int,
-    ransac_iters: int,
-    ransac_thr: float,
-) -> tuple[list[str], list[np.ndarray], dict[str, np.ndarray | float]]:
-    train_stems = load_train_stems(scene_dir)
-    intrinsics = np.load(mast3r_dir / "camera_intrinsics.npy").astype(np.float64)
-    camera_poses = np.load(mast3r_dir / "camera_poses.npy").astype(np.float64)
-    masks = np.load(mask_path, mmap_mode="r")
-    if masks.shape[0] != len(train_stems):
-        raise ValueError(f"Mask count {masks.shape[0]} does not match train stem count {len(train_stems)}")
-    ground = estimate_ground_frame(
-        mast3r_dir,
-        camera_poses,
-        n_sample=n_sample,
-        ransac_iters=ransac_iters,
-        ransac_thr=ransac_thr,
-    )
+def load_projected_ground_artifacts(
+    ground_dir: Path,
+) -> tuple[list[str], list[np.ndarray], dict[str, np.ndarray | float], dict[str, Any]]:
+    plane_frame_path = ground_dir / "plane_frame.json"
+    projected_train_path = ground_dir / "projected_train.npz"
+    if not plane_frame_path.exists():
+        raise FileNotFoundError(f"Missing plane frame artifact: {plane_frame_path}")
+    if not projected_train_path.exists():
+        raise FileNotFoundError(f"Missing projected UV artifact: {projected_train_path}")
 
-    full_width = int(masks.shape[2])
-    plane_normal = np.asarray(ground["plane_normal"], dtype=np.float64)
-    plane_d = float(ground["plane_d"])
-    origin = np.asarray(ground["origin"], dtype=np.float64)
-    axis_x = np.asarray(ground["axis_x"], dtype=np.float64)
-    axis_y = np.asarray(ground["axis_y"], dtype=np.float64)
+    plane_frame = json.loads(plane_frame_path.read_text(encoding="utf-8"))
+    projected = np.load(projected_train_path)
+    uv_points = np.asarray(projected["uv_points"], dtype=np.float32)
+    uv_offsets = np.asarray(projected["uv_offsets"], dtype=np.int64)
+    train_stems = projected["train_stems"].astype(str).tolist()
+    if uv_offsets.shape[0] != len(train_stems) + 1:
+        raise ValueError(
+            "Projected UV offsets do not match train stem count: "
+            f"offsets={uv_offsets.shape[0]} stems={len(train_stems)}"
+        )
 
     projected_uvs: list[np.ndarray] = []
-    for cam_idx in range(masks.shape[0]):
-        K_full = scale_intrinsics_to_fullres(intrinsics[cam_idx], full_width, court_base_width)
-        mask = np.asarray(masks[cam_idx], dtype=np.uint8)
-        uv, _ = project_mask_to_plane(
-            mask=mask,
-            c2w=camera_poses[cam_idx],
-            K_full=K_full,
-            plane_normal=plane_normal,
-            plane_d=plane_d,
-            origin=origin,
-            axis_x=axis_x,
-            axis_y=axis_y,
-        )
-        projected_uvs.append(uv)
-    return train_stems, projected_uvs, ground
+    for idx in range(len(train_stems)):
+        start = int(uv_offsets[idx])
+        end = int(uv_offsets[idx + 1])
+        projected_uvs.append(uv_points[start:end])
+
+    plane = plane_frame["plane"]
+    ground = {
+        "plane_normal": np.asarray(plane["normal"], dtype=np.float64),
+        "plane_d": float(plane["d"]),
+        "origin": np.asarray(plane["origin"], dtype=np.float64),
+        "axis_x": np.asarray(plane["axis_x"], dtype=np.float64),
+        "axis_y": np.asarray(plane["axis_y"], dtype=np.float64),
+        "mast3r_dir": plane_frame.get("mast3r_dir"),
+        "scene_dir": plane_frame.get("scene_dir"),
+    }
+    return train_stems, projected_uvs, ground, {
+        "plane_frame_path": str(plane_frame_path),
+        "projected_train_path": str(projected_train_path),
+        "plane_frame": plane_frame,
+    }
 
 
 def choose_extent(all_uv: np.ndarray, percentile: float, margin: float) -> tuple[float, float, float, float]:
@@ -855,7 +840,12 @@ def initial_params_from_ground(ground: dict[str, np.ndarray | float], adjacent_d
 
     from tools.scene_viewer.utils.court_init_estimator import CourtInitEstimator
 
-    estimator = CourtInitEstimator(Path(ground["mast3r_dir"]) if "mast3r_dir" in ground else Path("data/tennis_court/mast3r"))
+    mast3r_dir = ground.get("mast3r_dir")
+    estimator = CourtInitEstimator(
+        Path(str(mast3r_dir)).expanduser()
+        if mast3r_dir is not None
+        else Path("data/tennis_court/mast3r")
+    )
     res = estimator.estimate()
     estimator_scale = float(res["scale"])
     rotation = np.asarray(res["rotation"], dtype=np.float64)
@@ -899,8 +889,7 @@ def save_chunk_contact_sheet(chunk_images: list[Path], output_path: Path, thumb_
 def main() -> None:
     args = parse_args()
     scene_dir = args.scene_dir.expanduser().resolve()
-    mast3r_dir = args.mast3r_dir.expanduser().resolve() if args.mast3r_dir is not None else scene_dir / "mast3r"
-    mask_path = args.mask_path.expanduser().resolve() if args.mask_path is not None else scene_dir / "court" / "line" / "court_line_masks.npy"
+    ground_dir = args.ground_dir.expanduser().resolve() if args.ground_dir is not None else scene_dir / "court" / "ground"
     transform_dir = args.transform_dir.expanduser().resolve() if args.transform_dir is not None else scene_dir / "court" / "transform"
     output_dir = args.output_dir.expanduser().resolve()
     chunk_dir = output_dir / "chunks"
@@ -908,17 +897,9 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Projecting per-camera court-line masks to the ground plane...", flush=True)
-    train_stems, projected_uvs, ground = build_camera_uvs(
-        scene_dir=scene_dir,
-        mast3r_dir=mast3r_dir,
-        mask_path=mask_path,
-        court_base_width=args.court_base_width,
-        n_sample=args.n_sample,
-        ransac_iters=args.ransac_iters,
-        ransac_thr=args.ransac_thr,
-    )
-    ground["mast3r_dir"] = str(mast3r_dir)
+    print("Loading projected ground-plane court-line artifacts...", flush=True)
+    train_stems, projected_uvs, ground, ground_inputs = load_projected_ground_artifacts(ground_dir)
+    mast3r_dir = Path(str(ground["mast3r_dir"])).expanduser().resolve() if ground.get("mast3r_dir") else scene_dir / "mast3r"
     all_uv = np.concatenate([uv for uv in projected_uvs if uv.size > 0], axis=0)
     extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
     init_params = initial_params_from_ground(ground, args.adjacent_court_direction, args.init_gap)
@@ -1031,8 +1012,10 @@ def main() -> None:
     fit_result_path = transform_dir / "ground_heatmap_fit.json"
     fit_result = {
         "scene_dir": str(scene_dir),
+        "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
-        "mask_path": str(mask_path),
+        "plane_frame_path": ground_inputs["plane_frame_path"],
+        "projected_train_path": ground_inputs["projected_train_path"],
         "adjacent_court_direction": args.adjacent_court_direction,
         "selected_fit_source": selected_fit_source,
         "dominant_cluster": int(dominant_label),
@@ -1051,8 +1034,10 @@ def main() -> None:
 
     transform_manifest = {
         "scene_dir": str(scene_dir),
+        "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
-        "mask_path": str(mask_path),
+        "plane_frame_path": ground_inputs["plane_frame_path"],
+        "projected_train_path": ground_inputs["projected_train_path"],
         "transform_dir": str(transform_dir),
         "debug_output_dir": str(output_dir),
         "fit_result_path": str(fit_result_path),
@@ -1062,8 +1047,10 @@ def main() -> None:
 
     metadata = {
         "scene_dir": str(scene_dir),
+        "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
-        "mask_path": str(mask_path),
+        "plane_frame_path": ground_inputs["plane_frame_path"],
+        "projected_train_path": ground_inputs["projected_train_path"],
         "output_dir": str(output_dir),
         "transform_dir": str(transform_dir),
         "adjacent_court_direction": args.adjacent_court_direction,
