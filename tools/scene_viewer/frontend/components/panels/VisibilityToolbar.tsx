@@ -10,7 +10,7 @@ interface VisibilityToolbarProps {
 
 const ITEMS: { key: keyof VisibilityFlags; label: string; emoji: string }[] = [
   { key: 'pointCloud', label: '点群', emoji: '☁️' },
-  { key: 'origCameras', label: '元カメラ', emoji: '🔵' },
+  { key: 'origCameras', label: '最適化カメラ', emoji: '🔵' },
   { key: 'court', label: 'コート', emoji: '🏟️' },
 ];
 

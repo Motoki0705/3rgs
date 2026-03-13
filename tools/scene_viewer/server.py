@@ -30,9 +30,10 @@ Supports three modes:
               --port 8090
 
   --mode court-result
-      Visualize the output of fit_from_ground_heatmap.py.
-      Shows the MASt3R point cloud, original cameras, and two-court
-      wireframes from ground_heatmap_fit_sim3.json.
+      Visualize the fixed-court pose optimization result.
+      Shows the MASt3R point cloud, pose-optimized cameras from
+      court/pose_opt/optimized_camera_poses.npy, and two-court wireframes
+      from court/transform/ground_heatmap_fit_sim3.json.
 
       Usage:
           python tools/scene_viewer/server.py \
@@ -383,8 +384,13 @@ def sim3_to_matrix(sim3: dict) -> np.ndarray:
     return matrix
 
 
-def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_000) -> dict:
-    """Load court transform output for visualization."""
+def load_court_result(
+    scene_dir: Path,
+    transform_dir: Path,
+    pose_opt_dir: Path,
+    n_sample: int = 50_000,
+) -> dict:
+    """Load fixed-court pose optimization output for visualization."""
     t0 = time.time()
     mast3r_dir = scene_dir / "mast3r"
 
@@ -397,14 +403,23 @@ def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_0
     est = CourtInitEstimator(mast3r_dir)
     pts_xyz, pts_rgb = est._load_point_cloud(n_sample)
 
-    # Original camera poses + intrinsics (MASt3R)
-    orig_poses = np.load(mast3r_dir / "camera_poses.npy")    # (N, 4, 4)
-    intrinsics = np.load(mast3r_dir / "camera_intrinsics.npy")  # (N, 3, 3)
+    orig_poses = np.load(mast3r_dir / "camera_poses.npy")
+    intrinsics = np.load(mast3r_dir / "camera_intrinsics.npy")
+    optimized_poses_path = pose_opt_dir / "optimized_camera_poses.npy"
+    pose_opt_summary_path = pose_opt_dir / "camera_pose_opt.json"
+    if not optimized_poses_path.exists():
+        raise FileNotFoundError(f"Missing optimized camera poses: {optimized_poses_path}")
+    if not pose_opt_summary_path.exists():
+        raise FileNotFoundError(f"Missing pose optimization summary: {pose_opt_summary_path}")
+    optimized_poses = np.load(optimized_poses_path)
+    pose_opt_summary = json.loads(pose_opt_summary_path.read_text(encoding="utf-8"))
     n_cams = orig_poses.shape[0]
+    if optimized_poses.shape != orig_poses.shape:
+        raise ValueError(
+            f"Optimized poses shape {optimized_poses.shape} does not match original poses {orig_poses.shape}"
+        )
 
-    fit_path = transform_dir / "ground_heatmap_fit.json"
     sim3_path = transform_dir / "ground_heatmap_fit_sim3.json"
-    fit_result = json.loads(fit_path.read_text(encoding="utf-8"))
     sim3_json = json.loads(sim3_path.read_text(encoding="utf-8"))
     sim3_matrix = sim3_to_matrix(sim3_json)
     adjacent_direction = str(sim3_json.get("adjacent_direction", "+x"))
@@ -422,7 +437,7 @@ def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_0
     if img_list_path.exists():
         stems = img_list_path.read_text(encoding="utf-8").splitlines()
     else:
-        stems = fit_result.get("train_stems", [])
+        stems = []
 
     from utils.court_scheme import COURT_SKELETON, DOUBLES_WIDTH, court_keypoints_3d  # noqa: PLC0415
     court_pair = {
@@ -433,16 +448,19 @@ def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_0
     for i in range(n_cams):
         K = intrinsics[i]
         stem = stems[i] if i < len(stems) else f"cam_{i:04d}"
+        delta = float(np.linalg.norm(optimized_poses[i, :3, 3] - orig_poses[i, :3, 3]))
         cameras.append({
             "image_name": stem + ".jpg",
             "idx": i,
             "c2w": orig_poses[i].tolist(),
+            "c2w_refined": optimized_poses[i].tolist(),
             "fx": float(K[0, 0]),
             "fy": float(K[1, 1]),
             "cx": float(K[0, 2]),
             "cy": float(K[1, 2]),
             "width":  int(round(K[0, 2] * 2)),
             "height": int(round(K[1, 2] * 2)),
+            "delta": delta,
         })
 
     kp_court = court_keypoints_3d().cpu().numpy().tolist()
@@ -460,11 +478,13 @@ def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_0
         "court_skeleton": COURT_SKELETON,
         "metrics_summary": {
             "num_cameras": n_cams,
-            "pose_trans_sigma": 0.0,
+            "pose_trans_sigma": float(
+                np.std(np.linalg.norm(optimized_poses[:, :3, 3] - orig_poses[:, :3, 3], axis=1))
+            ),
             "adjacent_gap": sim3["adjacent_gap"],
             "adjacent_direction": adjacent_direction,
-            "total_loss": float(fit_result.get("loss", {}).get("total", 0.0)),
-            "selected_fit_source": fit_result.get("selected_fit_source", "unknown"),
+            "total_loss": float(pose_opt_summary.get("loss_final", {}).get("total", 0.0)),
+            "selected_fit_source": "pose_opt_fixed_sim3",
         },
         "image_dir": str(scene_dir / "images"),
     }
@@ -531,13 +551,14 @@ def main():
         "--transform-dir",
         default=None,
         help="[court-result mode] Path to court/transform directory containing "
-             "ground_heatmap_fit.json and ground_heatmap_fit_sim3.json. "
-             "Defaults to <scene-dir>/court/transform",
+             "ground_heatmap_fit_sim3.json. Defaults to <scene-dir>/court/transform",
     )
     parser.add_argument(
-        "--align-dir",
+        "--pose-opt-dir",
         default=None,
-        help="[court-result mode] Deprecated alias for --transform-dir.",
+        help="[court-result mode] Path to court/pose_opt directory containing "
+             "optimized_camera_poses.npy and camera_pose_opt.json. "
+             "Defaults to <scene-dir>/court/pose_opt",
     )
     args = parser.parse_args()
 
@@ -596,16 +617,21 @@ def main():
             transform_dir = Path(args.transform_dir)
             if not transform_dir.is_absolute():
                 transform_dir = REPO_ROOT / transform_dir
-        elif args.align_dir is not None:
-            transform_dir = Path(args.align_dir)
-            if not transform_dir.is_absolute():
-                transform_dir = REPO_ROOT / transform_dir
         else:
             transform_dir = scene_dir / "court" / "transform"
         transform_dir = transform_dir.resolve()
 
-        print(f"[court_result] Loading transform results from {transform_dir} …", flush=True)
-        COURT_RESULT_DATA = load_court_result(scene_dir, transform_dir, n_sample=args.n_sample)
+        if args.pose_opt_dir is not None:
+            pose_opt_dir = Path(args.pose_opt_dir)
+            if not pose_opt_dir.is_absolute():
+                pose_opt_dir = REPO_ROOT / pose_opt_dir
+        else:
+            pose_opt_dir = scene_dir / "court" / "pose_opt"
+        pose_opt_dir = pose_opt_dir.resolve()
+
+        print(f"[court_result] Loading transform from {transform_dir} …", flush=True)
+        print(f"[court_result] Loading optimized cameras from {pose_opt_dir} …", flush=True)
+        COURT_RESULT_DATA = load_court_result(scene_dir, transform_dir, pose_opt_dir, n_sample=args.n_sample)
         print(f"[court_result] Starting server at http://localhost:{args.port}/court_result")
         app.run(host="0.0.0.0", port=args.port, debug=False)
 

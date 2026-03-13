@@ -86,7 +86,7 @@ export const CourtResultModePage: React.FC = () => {
   const selectedCam = selectedIdx !== null ? data.cameras[selectedIdx] : null;
 
   const legendItems = [
-    { color: CSS_ORIG, label: '元カメラ (SfM)', shape: 'dot' as const },
+    { color: CSS_ORIG, label: '最適化カメラ', shape: 'dot' as const },
     { color: CSS_COURT1, label: 'コート 1', shape: 'line' as const },
     { color: CSS_COURT2, label: 'コート 2', shape: 'line' as const },
   ];
@@ -119,13 +119,13 @@ export const CourtResultModePage: React.FC = () => {
           <PointCloudLayer data={data.pointCloud} visible={flags.pointCloud} />
           <CameraLayer
             cameras={data.cameras}
-            variants={['orig']}
+            variants={['refined']}
             frustumDepth={FRUSTUM_DEPTH_COURT_RESULT}
             dotRadius={DOT_RADIUS_COURT_RESULT}
             clickRadius={CLICK_SPHERE_RADIUS_COURT_RESULT}
             selectedIdx={selectedIdx}
             onSelect={(idx) => select(idx)}
-            visibleOrig={flags.origCameras}
+            visibleRefined={flags.origCameras}
           />
           <CourtLayer
             court={data.court}

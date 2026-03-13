@@ -38,7 +38,9 @@ export const CameraInspectorPanel: React.FC<CameraInspectorPanelProps> = ({
 
   if (!cam) return null;
 
-  const pos = [cam.c2w[0][3], cam.c2w[1][3], cam.c2w[2][3]];
+  const currentPose = cam.c2wRefined ?? cam.c2w;
+  const pos = [currentPose[0][3], currentPose[1][3], currentPose[2][3]];
+  const origPos = [cam.c2w[0][3], cam.c2w[1][3], cam.c2w[2][3]];
 
   return (
     <div style={styles.panel}>
@@ -91,12 +93,16 @@ export const CameraInspectorPanel: React.FC<CameraInspectorPanelProps> = ({
         <Row label="画像" value={cam.imageName} />
         <Row label="解像度" value={`${cam.width} × ${cam.height}`} />
         <Row label="fx / fy" value={`${cam.fx.toFixed(1)} / ${cam.fy.toFixed(1)}`} />
-        <Row label="位置" value={pos.map((v) => v.toFixed(3)).join(', ')} />
+        <Row label="表示位置" value={pos.map((v) => v.toFixed(3)).join(', ')} />
         {cam.c2wRefined && (
           <>
-            <div style={styles.secHd}>Pose Refinement (MLP)</div>
+            <div style={styles.secHd}>Pose Optimization</div>
             <Row
-              label="Refine後位置"
+              label="元位置"
+              value={origPos.map((v) => v.toFixed(3)).join(', ')}
+            />
+            <Row
+              label="最適化後位置"
               value={[cam.c2wRefined[0][3], cam.c2wRefined[1][3], cam.c2wRefined[2][3]]
                 .map((v) => v.toFixed(3))
                 .join(', ')}
