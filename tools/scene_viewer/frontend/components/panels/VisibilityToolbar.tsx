@@ -11,8 +11,6 @@ interface VisibilityToolbarProps {
 const ITEMS: { key: keyof VisibilityFlags; label: string; emoji: string }[] = [
   { key: 'pointCloud', label: '点群', emoji: '☁️' },
   { key: 'origCameras', label: '元カメラ', emoji: '🔵' },
-  { key: 'refinedCameras', label: '最適化カメラ', emoji: '🟠' },
-  { key: 'deltaLines', label: 'Δ線', emoji: '📐' },
   { key: 'court', label: 'コート', emoji: '🏟️' },
 ];
 

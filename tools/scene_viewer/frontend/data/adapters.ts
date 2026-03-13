@@ -122,6 +122,8 @@ export function courtResultAdapter(raw: any): CourtResultViewModel {
     adjacentDirection: ms.adjacent_direction ?? '+x',
     maxDelta,
     meanDelta,
+    totalLoss: ms.total_loss,
+    selectedFitSource: ms.selected_fit_source,
   };
 
   return {

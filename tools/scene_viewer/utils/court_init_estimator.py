@@ -9,7 +9,7 @@ estimates an initial court-to-world Sim(3) transform by:
 3. Estimating scale from the bounding box vs known ITF court dimensions
 4. Computing the translation from the projected point centroid
 
-Outputs a dict in the same format as fit_court_sim3.py's --init-sim3-path JSON:
+Outputs a dict in the same format as court transform init_sim3.json:
 {
     "scale": float,
     "rotation": [[3x3]],
@@ -478,7 +478,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=None,
-        help="Output JSON path. Defaults to <mast3r-dir>/court_alignment/init_sim3.json",
+        help="Output JSON path. Defaults to <mast3r-dir>/../court/transform/init_sim3.json",
     )
     parser.add_argument("--n-sample", type=int, default=50_000)
     parser.add_argument("--adjacent-direction", default="+x",
@@ -492,7 +492,7 @@ def main() -> None:
     output = (
         args.output.resolve()
         if args.output is not None
-        else mast3r_dir / "court_alignment" / "init_sim3.json"
+        else mast3r_dir.parent / "court" / "transform" / "init_sim3.json"
     )
 
     est = CourtInitEstimator(mast3r_dir)

@@ -7,9 +7,9 @@
 - `scene` モード
   3DGS のチェックポイントから点群を取り出し、元カメラと refine 後カメラを比較表示します。
 - `court-init` モード
-  MASt3R 点群の上にテニスコートのワイヤーフレームを重ね、`fit_court_sim3.py` 用の初期 Sim(3) を手動調整して保存します。
+  MASt3R 点群の上にテニスコートのワイヤーフレームを重ね、`init_sim3.json` を手動調整して保存します。
 - `court-result` モード
-  `fit_court_sim3.py` の最適化結果を可視化し、元カメラと refined カメラの差分や最終コート配置を確認します。
+  `fit_from_ground_heatmap.py` の transform 結果を可視化し、最終コート配置を確認します。
 
 ## 推奨起動方法
 
@@ -89,7 +89,7 @@ source .venv/bin/activate
 python tools/scene_viewer/server.py \
   --mode court-init \
   --scene-dir data/tennis_court \
-  --output data/tennis_court/mast3r/court_alignment/init_sim3.json \
+  --output data/tennis_court/court/transform/init_sim3.json \
   --port 8090
 ```
 
@@ -98,7 +98,7 @@ python tools/scene_viewer/server.py \
 - `--n-sample`: PLY から読み込む点群サンプル数
 - `--adjacent-direction`: 隣接コートの向き (`+x`, `-x`, `+y`, `-y`)
 - `--init-gap`: 隣接コート間の初期 gap
-- `--output`: 保存先。未指定時は `<scene-dir>/mast3r/court_alignment/init_sim3.json`
+- `--output`: 保存先。未指定時は `<scene-dir>/court/transform/init_sim3.json`
 
 画面上でできること:
 - スライダーで `translation / rotation / scale / gap` を調整
@@ -110,9 +110,9 @@ python tools/scene_viewer/server.py \
 ### 3. `court-result`
 
 役割:
-- `fit_court_sim3.py` の出力を最終確認するためのビューアです。
-- MASt3R 点群、元カメラ、refined カメラ、差分線、2 面分のコートを重ねて表示します。
-- カメラごとの移動量や最適化後 Sim(3) の要約を確認できます。
+- `fit_from_ground_heatmap.py` の出力を最終確認するためのビューアです。
+- MASt3R 点群、元カメラ、2 面分のコートを重ねて表示します。
+- heatmap fit から得た Sim(3) と gap の要約を確認できます。
 
 開く URL:
 - `http://localhost:8092/court_result`
@@ -129,7 +129,7 @@ python tools/scene_viewer/server.py \
   --n-sample 50000
 ```
 
-`court_alignment` ディレクトリを明示する場合:
+`court/transform` ディレクトリを明示する場合:
 
 ```bash
 cd /root/repos/3rgs
@@ -137,19 +137,19 @@ source .venv/bin/activate
 python tools/scene_viewer/server.py \
   --mode court-result \
   --scene-dir data/tennis_court \
-  --align-dir data/tennis_court/mast3r/court_alignment \
+  --transform-dir data/tennis_court/court/transform \
   --port 8092
 ```
 
 主な入力:
 - `--scene-dir`: 元シーン
-- `--align-dir`: `sim3_refined.npz` などを含む結果ディレクトリ
+- `--transform-dir`: `ground_heatmap_fit.json` と `ground_heatmap_fit_sim3.json` を含む結果ディレクトリ
 - `--n-sample`: 表示する MASt3R 点群サンプル数
 
 画面上でできること:
-- 点群、元カメラ、refined カメラ、差分線、コートの表示切替
+- 点群、元カメラ、コートの表示切替
 - カメラ一覧から個別カメラを選択してワープ
-- `Sim3 scale`、`adjacent gap`、`adjacent direction`、カメラ移動量を確認
+- `Sim3 scale`、`adjacent gap`、`adjacent direction`、fit source、total loss を確認
 
 ## モードごとの必要ファイル
 
@@ -173,8 +173,7 @@ python tools/scene_viewer/server.py \
 
 ### `court-result`
 
-`court-init` と同じ入力に加えて、通常は `mast3r/court_alignment/` 配下に以下が必要です。
+`court-init` と同じ入力に加えて、通常は `court/transform/` 配下に以下が必要です。
 
-- `sim3_refined.npz`
-- `camera_poses_refined.npy`
-- `metrics.json`
+- `ground_heatmap_fit.json`
+- `ground_heatmap_fit_sim3.json`

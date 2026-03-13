@@ -54,6 +54,8 @@ export interface MetricsModel {
   adjacentDirection: string;
   maxDelta: number;
   meanDelta: number;
+  totalLoss?: number;
+  selectedFitSource?: string;
 }
 
 // ── Court pair model (court-result) ─────────────────────────────────────────

@@ -1,4 +1,4 @@
-/** MetricsPanel — court-result optimisation metrics display. */
+/** MetricsPanel — court-result transform metrics display. */
 
 import React from 'react';
 import type { MetricsModel, Sim3Model } from '@/data/models';
@@ -10,13 +10,13 @@ interface MetricsPanelProps {
 
 export const MetricsPanel: React.FC<MetricsPanelProps> = ({ metrics, sim3 }) => (
   <div style={styles.section}>
-    <div style={styles.sectionTitle}>最適化結果</div>
+    <div style={styles.sectionTitle}>Transform 結果</div>
     <KV k="カメラ数" v={String(metrics.numCameras)} />
     <KV k="Sim3 scale" v={sim3.scale.toExponential(4)} />
     <KV k="隣接gap" v={`${metrics.adjacentGap.toFixed(4)} m`} />
     <KV k="隣接方向" v={metrics.adjacentDirection} />
-    <KV k="最大位置差分" v={metrics.maxDelta.toFixed(4)} />
-    <KV k="平均位置差分" v={metrics.meanDelta.toFixed(4)} />
+    <KV k="fit source" v={metrics.selectedFitSource ?? 'unknown'} />
+    <KV k="total loss" v={(metrics.totalLoss ?? 0).toFixed(4)} />
     <div style={styles.sim3Text}>
       {`t: [${sim3.translation.map((v) => v.toFixed(4)).join(', ')}]\n` +
         `scale: ${sim3.scale.toExponential(4)}\n` +

@@ -8,7 +8,6 @@ import { CanvasViewport } from '@/components/viewport/CanvasViewport';
 import { SceneRoot } from '@/components/viewport/SceneRoot';
 import { PointCloudLayer } from '@/components/layers/PointCloudLayer';
 import { CameraLayer } from '@/components/layers/CameraLayer';
-import { DeltaLineLayer } from '@/components/layers/DeltaLineLayer';
 import { CourtLayer } from '@/components/layers/CourtLayer';
 import { FlyNavigationController } from '@/components/controllers/FlyNavigationController';
 import { AutoFitController } from '@/components/controllers/AutoFitController';
@@ -26,8 +25,6 @@ import { ModeHeader } from '@/components/panels/ModeHeader';
 import { FRUSTUM_DEPTH_COURT_RESULT, DOT_RADIUS_COURT_RESULT, CLICK_SPHERE_RADIUS_COURT_RESULT } from '@/config/navigationConfig';
 import {
   CSS_ORIG,
-  CSS_REFINED,
-  CSS_DELTA,
   CSS_COURT1,
   CSS_COURT2,
 } from '@/config/viewerTheme';
@@ -90,8 +87,6 @@ export const CourtResultModePage: React.FC = () => {
 
   const legendItems = [
     { color: CSS_ORIG, label: '元カメラ (SfM)', shape: 'dot' as const },
-    { color: CSS_REFINED, label: '最適化カメラ', shape: 'dot' as const },
-    { color: CSS_DELTA, label: 'Δ 移動', shape: 'line' as const },
     { color: CSS_COURT1, label: 'コート 1', shape: 'line' as const },
     { color: CSS_COURT2, label: 'コート 2', shape: 'line' as const },
   ];
@@ -124,16 +119,14 @@ export const CourtResultModePage: React.FC = () => {
           <PointCloudLayer data={data.pointCloud} visible={flags.pointCloud} />
           <CameraLayer
             cameras={data.cameras}
-            variants={['orig', 'refined']}
+            variants={['orig']}
             frustumDepth={FRUSTUM_DEPTH_COURT_RESULT}
             dotRadius={DOT_RADIUS_COURT_RESULT}
             clickRadius={CLICK_SPHERE_RADIUS_COURT_RESULT}
             selectedIdx={selectedIdx}
             onSelect={(idx) => select(idx)}
             visibleOrig={flags.origCameras}
-            visibleRefined={flags.refinedCameras}
           />
-          <DeltaLineLayer cameras={data.cameras} visible={flags.deltaLines} />
           <CourtLayer
             court={data.court}
             sim3={data.sim3}

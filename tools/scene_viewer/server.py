@@ -2,7 +2,7 @@
 """
 Scene Viewer Server
 ------------------
-Supports two modes:
+Supports three modes:
 
   --mode scene (default)
       Serves a web UI for visualizing:
@@ -18,7 +18,7 @@ Supports two modes:
               --port 8080
 
   --mode court-init
-      Interactive Sim(3) initializer for fit_court_sim3.py.
+      Interactive Sim(3) initializer for court transform editing.
       Displays MASt3R point cloud + cameras + two-court wireframe overlay.
       Allows manual adjustment of scale/rotation/translation/gap and saves
       the result as init_sim3.json.
@@ -30,9 +30,9 @@ Supports two modes:
               --port 8090
 
   --mode court-result
-      Visualize the output of fit_court_sim3.py.
-      Shows the MASt3R point cloud, original cameras (blue), refined
-      cameras (orange), and two-court wireframes from sim3_refined.npz.
+      Visualize the output of fit_from_ground_heatmap.py.
+      Shows the MASt3R point cloud, original cameras, and two-court
+      wireframes from ground_heatmap_fit_sim3.json.
 
       Usage:
           python tools/scene_viewer/server.py \
@@ -298,7 +298,7 @@ def court_result_page():
 
 @app.route("/api/court_result_scene")
 def api_court_result_scene():
-    """Return court alignment result data for visualization."""
+    """Return court transform result data for visualization."""
     if COURT_RESULT_DATA is None:
         return jsonify({"error": "court-result mode not active"}), 503
     return jsonify(COURT_RESULT_DATA)
@@ -364,8 +364,27 @@ def api_load_sim3():
 
 # ─── Court-result data loader ────────────────────────────────────────────────
 
-def load_court_result(scene_dir: Path, align_dir: Path, n_sample: int = 50_000) -> dict:
-    """Load fit_court_sim3.py output for visualization."""
+def adjacent_direction_vector(direction: str) -> list[float]:
+    mapping = {
+        "+x": [1.0, 0.0, 0.0],
+        "-x": [-1.0, 0.0, 0.0],
+        "+y": [0.0, 1.0, 0.0],
+        "-y": [0.0, -1.0, 0.0],
+    }
+    return mapping.get(direction, [1.0, 0.0, 0.0])
+
+
+def sim3_to_matrix(sim3: dict) -> np.ndarray:
+    rotation = np.asarray(sim3["rotation"], dtype=np.float64)
+    translation = np.asarray(sim3["translation"], dtype=np.float64)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = float(sim3["scale"]) * rotation
+    matrix[:3, 3] = translation
+    return matrix
+
+
+def load_court_result(scene_dir: Path, transform_dir: Path, n_sample: int = 50_000) -> dict:
+    """Load court transform output for visualization."""
     t0 = time.time()
     mast3r_dir = scene_dir / "mast3r"
 
@@ -383,53 +402,47 @@ def load_court_result(scene_dir: Path, align_dir: Path, n_sample: int = 50_000) 
     intrinsics = np.load(mast3r_dir / "camera_intrinsics.npy")  # (N, 3, 3)
     n_cams = orig_poses.shape[0]
 
-    # Refined camera poses
-    ref_poses = np.load(align_dir / "camera_poses_refined.npy")  # (N, 4, 4)
-
-    # Sim3 (refined)
-    npz = np.load(align_dir / "sim3_refined.npz")
+    fit_path = transform_dir / "ground_heatmap_fit.json"
+    sim3_path = transform_dir / "ground_heatmap_fit_sim3.json"
+    fit_result = json.loads(fit_path.read_text(encoding="utf-8"))
+    sim3_json = json.loads(sim3_path.read_text(encoding="utf-8"))
+    sim3_matrix = sim3_to_matrix(sim3_json)
+    adjacent_direction = str(sim3_json.get("adjacent_direction", "+x"))
     sim3 = {
-        "scale": float(npz["scale"]),
-        "rotation": npz["rotation"].tolist(),
-        "translation": npz["translation"].tolist(),
-        "matrix": npz["matrix"].tolist(),
-        "adjacent_gap": float(npz["adjacent_gap"]),
-        "adjacent_direction": npz["adjacent_direction"].tolist(),
+        "scale": float(sim3_json["scale"]),
+        "rotation": sim3_json["rotation"],
+        "translation": sim3_json["translation"],
+        "matrix": sim3_matrix.tolist(),
+        "adjacent_gap": float(sim3_json.get("adjacent_gap", 0.0)),
+        "adjacent_direction": adjacent_direction,
     }
-
-    # Metrics
-    metrics = json.loads((align_dir / "metrics.json").read_text(encoding="utf-8"))
-    court_pair = metrics.get("court_pair", {})
-    train_stems = metrics.get("train_stems", [])
 
     # Image names
     img_list_path = scene_dir / "images_train.txt"
     if img_list_path.exists():
         stems = img_list_path.read_text(encoding="utf-8").splitlines()
     else:
-        stems = train_stems
+        stems = fit_result.get("train_stems", [])
 
-    # Camera list with per-camera refinement delta
-    from utils.court_scheme import COURT_SKELETON, court_keypoints_3d  # noqa: PLC0415
+    from utils.court_scheme import COURT_SKELETON, DOUBLES_WIDTH, court_keypoints_3d  # noqa: PLC0415
+    court_pair = {
+        "adjacent_center_offset": float(DOUBLES_WIDTH + sim3["adjacent_gap"]),
+        "adjacent_direction_vector": adjacent_direction_vector(adjacent_direction),
+    }
     cameras = []
     for i in range(n_cams):
         K = intrinsics[i]
         stem = stems[i] if i < len(stems) else f"cam_{i:04d}"
-        orig_t = orig_poses[i, :3, 3]
-        ref_t  = ref_poses[i, :3, 3]
-        delta  = float(np.linalg.norm(ref_t - orig_t))
         cameras.append({
             "image_name": stem + ".jpg",
             "idx": i,
             "c2w": orig_poses[i].tolist(),
-            "c2w_refined": ref_poses[i].tolist(),
             "fx": float(K[0, 0]),
             "fy": float(K[1, 1]),
             "cx": float(K[0, 2]),
             "cy": float(K[1, 2]),
             "width":  int(round(K[0, 2] * 2)),
             "height": int(round(K[1, 2] * 2)),
-            "delta": delta,
         })
 
     kp_court = court_keypoints_3d().cpu().numpy().tolist()
@@ -446,10 +459,12 @@ def load_court_result(scene_dir: Path, align_dir: Path, n_sample: int = 50_000) 
         "court_keypoints_court": kp_court,
         "court_skeleton": COURT_SKELETON,
         "metrics_summary": {
-            "num_cameras": metrics.get("num_train_cameras", n_cams),
-            "pose_trans_sigma": float(metrics.get("pose_trans_sigma", 0.0)),
-            "adjacent_gap": court_pair.get("adjacent_gap", 0.0),
-            "adjacent_direction": court_pair.get("adjacent_court_direction", "+x"),
+            "num_cameras": n_cams,
+            "pose_trans_sigma": 0.0,
+            "adjacent_gap": sim3["adjacent_gap"],
+            "adjacent_direction": adjacent_direction,
+            "total_loss": float(fit_result.get("loss", {}).get("total", 0.0)),
+            "selected_fit_source": fit_result.get("selected_fit_source", "unknown"),
         },
         "image_dir": str(scene_dir / "images"),
     }
@@ -469,7 +484,7 @@ def main():
         default="scene",
         help="Viewer mode: 'scene' for 3DGS checkpoint viewer, "
              "'court-init' for interactive Sim(3) initializer, "
-             "'court-result' for fit_court_sim3.py output visualization",
+             "'court-result' for court transform result visualization",
     )
     parser.add_argument(
         "--ckpt",
@@ -513,11 +528,16 @@ def main():
         help="[court-init mode] Initial edge-to-edge gap between adjacent courts (m)",
     )
     parser.add_argument(
+        "--transform-dir",
+        default=None,
+        help="[court-result mode] Path to court/transform directory containing "
+             "ground_heatmap_fit.json and ground_heatmap_fit_sim3.json. "
+             "Defaults to <scene-dir>/court/transform",
+    )
+    parser.add_argument(
         "--align-dir",
         default=None,
-        help="[court-result mode] Path to court_alignment directory containing "
-             "sim3_refined.npz, camera_poses_refined.npy etc. "
-             "Defaults to <scene-dir>/mast3r/court_alignment",
+        help="[court-result mode] Deprecated alias for --transform-dir.",
     )
     args = parser.parse_args()
 
@@ -572,16 +592,20 @@ def main():
             scene_dir = REPO_ROOT / scene_dir
         scene_dir = scene_dir.resolve()
 
-        if args.align_dir is not None:
-            align_dir = Path(args.align_dir)
-            if not align_dir.is_absolute():
-                align_dir = REPO_ROOT / align_dir
+        if args.transform_dir is not None:
+            transform_dir = Path(args.transform_dir)
+            if not transform_dir.is_absolute():
+                transform_dir = REPO_ROOT / transform_dir
+        elif args.align_dir is not None:
+            transform_dir = Path(args.align_dir)
+            if not transform_dir.is_absolute():
+                transform_dir = REPO_ROOT / transform_dir
         else:
-            align_dir = scene_dir / "mast3r" / "court_alignment"
-        align_dir = align_dir.resolve()
+            transform_dir = scene_dir / "court" / "transform"
+        transform_dir = transform_dir.resolve()
 
-        print(f"[court_result] Loading alignment results from {align_dir} …", flush=True)
-        COURT_RESULT_DATA = load_court_result(scene_dir, align_dir, n_sample=args.n_sample)
+        print(f"[court_result] Loading transform results from {transform_dir} …", flush=True)
+        COURT_RESULT_DATA = load_court_result(scene_dir, transform_dir, n_sample=args.n_sample)
         print(f"[court_result] Starting server at http://localhost:{args.port}/court_result")
         app.run(host="0.0.0.0", port=args.port, debug=False)
 

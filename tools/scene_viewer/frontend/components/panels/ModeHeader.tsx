@@ -19,7 +19,7 @@ const LABEL: Record<ModeName, { title: string; subtitle: string }> = {
   },
   'court-result': {
     title: 'Court Result Viewer',
-    subtitle: '最適化後のカメラとコート表示',
+    subtitle: 'ground heatmap fit の transform 結果表示',
   },
 };
 
