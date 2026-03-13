@@ -115,7 +115,8 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 
 - `fit_from_ground_heatmap.py` は `project_court_lines_to_ground.py` の成果物を直接読み込みます。
 - `project_court_lines_to_ground.py` は共通 raster grid と per-camera reliability map を生成します。
-- `fit_from_ground_heatmap.py` の forward loss は chunk reliability map で重み付けされます。
+- `fit_from_ground_heatmap.py` は global projection を土台にしつつ、chunk 外カメラの寄与を弱くした mixed count / reliability で fit します。
+- `fit_from_ground_heatmap.py` の forward loss は mixed reliability map で重み付けされます。
 - `fit_from_ground_heatmap.py` は `court/transform/init_sim3.json` を seed として読み込み、`CourtInitEstimator` は呼びません。
 - この fit は画像平面ではなく、推定された地面平面上で行います。
 - chunk clustering は、カメラポーズのドリフトの影響を減らすために入れています。

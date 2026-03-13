@@ -118,6 +118,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-gap-min", type=float, default=0.05)
     parser.add_argument("--search-iters", type=int, default=80)
     parser.add_argument("--max-gap", type=float, default=12.0)
+    parser.add_argument(
+        "--global-count-scale",
+        type=float,
+        default=0.2,
+        help="Relative contribution of non-chunk projected counts when building the chunk heatmap.",
+    )
+    parser.add_argument(
+        "--global-reliability-scale",
+        type=float,
+        default=0.15,
+        help="Relative contribution of non-chunk reliability when building the chunk forward-loss mask.",
+    )
     return parser.parse_args()
 
 
@@ -622,6 +634,22 @@ def build_counts_for_cameras(
     return rasterize_uv(merged, extent, resolution)
 
 
+def mix_chunk_counts(
+    global_counts: np.ndarray,
+    chunk_counts: np.ndarray,
+    global_count_scale: float,
+) -> np.ndarray:
+    if global_counts.shape != chunk_counts.shape:
+        raise ValueError(f"Global and chunk count shapes must match, got {global_counts.shape} vs {chunk_counts.shape}")
+    if global_count_scale <= 0.0:
+        return chunk_counts.astype(np.float32, copy=False)
+    other_counts = np.maximum(
+        global_counts.astype(np.float32, copy=False) - chunk_counts.astype(np.float32, copy=False),
+        0.0,
+    )
+    return chunk_counts.astype(np.float32, copy=False) + float(global_count_scale) * other_counts
+
+
 def build_reliability_for_cameras(
     confidence_maps: np.ndarray,
     camera_indices: list[int],
@@ -630,6 +658,27 @@ def build_reliability_for_cameras(
         return np.zeros(confidence_maps.shape[1:], dtype=np.float32)
     selected = np.clip(confidence_maps[camera_indices].astype(np.float32), 0.0, 1.0)
     return 1.0 - np.prod(1.0 - selected, axis=0, dtype=np.float32)
+
+
+def mix_chunk_reliability(
+    confidence_maps: np.ndarray,
+    chunk_camera_indices: list[int],
+    global_reliability_scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    chunk_reliability = build_reliability_for_cameras(confidence_maps, chunk_camera_indices)
+    if global_reliability_scale <= 0.0 or len(chunk_camera_indices) >= confidence_maps.shape[0]:
+        return chunk_reliability, chunk_reliability, np.zeros_like(chunk_reliability, dtype=np.float32)
+
+    other_mask = np.ones((confidence_maps.shape[0],), dtype=bool)
+    other_mask[np.asarray(chunk_camera_indices, dtype=np.int64)] = False
+    other_indices = np.flatnonzero(other_mask).tolist()
+    other_reliability = build_reliability_for_cameras(confidence_maps, other_indices)
+    mixed_reliability = 1.0 - (1.0 - chunk_reliability) * (1.0 - float(global_reliability_scale) * other_reliability)
+    return (
+        np.clip(mixed_reliability, 0.0, 1.0).astype(np.float32, copy=False),
+        chunk_reliability.astype(np.float32, copy=False),
+        other_reliability.astype(np.float32, copy=False),
+    )
 
 
 def fit_single_heatmap(
@@ -955,14 +1004,20 @@ def main() -> None:
     chunk_images: list[Path] = []
     previous_fit: FitResult | None = None
     chunk_index = 0
+    global_counts = build_counts_for_cameras(projected_uvs, list(range(len(projected_uvs))), extent, resolution).astype(np.float32)
     for start in range(0, len(projected_uvs), max(1, args.window_stride)):
         end = min(len(projected_uvs), start + max(1, args.window_size))
         if end - start < 2:
             continue
         camera_indices = list(range(start, end))
-        counts = build_counts_for_cameras(projected_uvs, camera_indices, extent, resolution)
-        reliability = build_reliability_for_cameras(confidence_maps, camera_indices)
-        projected_pixels = int(np.sum(counts, dtype=np.float64))
+        chunk_counts = build_counts_for_cameras(projected_uvs, camera_indices, extent, resolution).astype(np.float32)
+        counts = mix_chunk_counts(global_counts, chunk_counts, args.global_count_scale)
+        reliability, chunk_reliability, other_reliability = mix_chunk_reliability(
+            confidence_maps,
+            camera_indices,
+            args.global_reliability_scale,
+        )
+        projected_pixels = int(np.sum(chunk_counts, dtype=np.float64))
         if projected_pixels <= 0:
             continue
         chunk_init = previous_fit.params if previous_fit is not None and np.isfinite(previous_fit.total_loss) else init_params
@@ -991,6 +1046,19 @@ def main() -> None:
         image_path = chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}.png"
         cv2.imwrite(str(image_path), render_overlay(chunk_heatmap, chunk_fit, adjacent_court_direction, args.line_thickness_px))
         chunk_images.append(image_path)
+        cv2.imwrite(
+            str(chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}_reliability.png"),
+            cv2.applyColorMap(np.clip(np.round(255.0 * reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+        )
+        cv2.imwrite(
+            str(chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}_chunk_reliability.png"),
+            cv2.applyColorMap(np.clip(np.round(255.0 * chunk_reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+        )
+        if float(np.max(other_reliability)) > 0.0:
+            cv2.imwrite(
+                str(chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}_other_reliability.png"),
+                cv2.applyColorMap(np.clip(np.round(255.0 * other_reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+            )
         if np.isfinite(chunk_fit.total_loss):
             previous_fit = chunk_fit
         chunk_index += 1
@@ -1013,8 +1081,13 @@ def main() -> None:
         dominant_label = int(best_chunk.cluster)
         dominant_cameras = list(best_chunk.camera_indices)
 
-    dominant_counts = build_counts_for_cameras(projected_uvs, dominant_cameras, extent, resolution)
-    dominant_reliability = build_reliability_for_cameras(confidence_maps, dominant_cameras)
+    dominant_chunk_counts = build_counts_for_cameras(projected_uvs, dominant_cameras, extent, resolution).astype(np.float32)
+    dominant_counts = mix_chunk_counts(global_counts, dominant_chunk_counts, args.global_count_scale)
+    dominant_reliability, dominant_chunk_reliability, dominant_other_reliability = mix_chunk_reliability(
+        confidence_maps,
+        dominant_cameras,
+        args.global_reliability_scale,
+    )
     best_chunk = min(chunk_records, key=lambda record: record.fit.total_loss)
     dominant_init = best_chunk.fit.params
     dominant_member_records = [record for record in chunk_records if record.cluster == dominant_label]
@@ -1036,6 +1109,19 @@ def main() -> None:
     )
     cv2.imwrite(str(output_dir / "dominant_cluster_overlay.png"), render_overlay(dominant_heatmap, final_fit, adjacent_court_direction, args.line_thickness_px))
     cv2.imwrite(str(output_dir / "dominant_cluster_heatmap.png"), cv2.applyColorMap(np.clip(np.round(255.0 * dominant_heatmap.weights), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO))
+    cv2.imwrite(
+        str(output_dir / "dominant_cluster_reliability.png"),
+        cv2.applyColorMap(np.clip(np.round(255.0 * dominant_reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+    )
+    cv2.imwrite(
+        str(output_dir / "dominant_cluster_chunk_reliability.png"),
+        cv2.applyColorMap(np.clip(np.round(255.0 * dominant_chunk_reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+    )
+    if float(np.max(dominant_other_reliability)) > 0.0:
+        cv2.imwrite(
+            str(output_dir / "dominant_cluster_other_reliability.png"),
+            cv2.applyColorMap(np.clip(np.round(255.0 * dominant_other_reliability), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO),
+        )
     save_chunk_contact_sheet(chunk_images, output_dir / "chunk_overlays_contact_sheet.png")
 
     selected_fit = final_fit
@@ -1044,8 +1130,16 @@ def main() -> None:
     if not np.isfinite(final_fit.total_loss):
         selected_fit = best_chunk.fit
         selected_heatmap, _ = fit_single_heatmap(
-            build_counts_for_cameras(projected_uvs, best_chunk.camera_indices, extent, resolution),
-            build_reliability_for_cameras(confidence_maps, best_chunk.camera_indices),
+            mix_chunk_counts(
+                global_counts,
+                build_counts_for_cameras(projected_uvs, best_chunk.camera_indices, extent, resolution).astype(np.float32),
+                args.global_count_scale,
+            ),
+            mix_chunk_reliability(
+                confidence_maps,
+                best_chunk.camera_indices,
+                args.global_reliability_scale,
+            )[0],
             extent,
             resolution,
             init_params=best_chunk.fit.params,
@@ -1071,6 +1165,8 @@ def main() -> None:
         "raster_grid_path": ground_inputs["raster_grid_path"],
         "visibility_train_path": ground_inputs["visibility_train_path"],
         "adjacent_court_direction": adjacent_court_direction,
+        "global_count_scale": float(args.global_count_scale),
+        "global_reliability_scale": float(args.global_reliability_scale),
         "seed_sim3": init_sim3_payload,
         "selected_fit_source": selected_fit_source,
         "dominant_cluster": int(dominant_label),
@@ -1100,6 +1196,8 @@ def main() -> None:
         "debug_output_dir": str(output_dir),
         "fit_result_path": str(fit_result_path),
         "sim3_path": str(sim3_path),
+        "global_count_scale": float(args.global_count_scale),
+        "global_reliability_scale": float(args.global_reliability_scale),
     }
     (transform_dir / "manifest.json").write_text(json.dumps(transform_manifest, indent=2), encoding="utf-8")
 
@@ -1118,6 +1216,8 @@ def main() -> None:
         "seed_sim3": init_sim3_payload,
         "extent_xy": [float(v) for v in extent],
         "grid_resolution": float(resolution),
+        "global_count_scale": float(args.global_count_scale),
+        "global_reliability_scale": float(args.global_reliability_scale),
         "ground_plane": {
             "normal": np.asarray(ground["plane_normal"], dtype=np.float64).tolist(),
             "d": float(ground["plane_d"]),
@@ -1153,8 +1253,12 @@ def main() -> None:
 
     np.savez_compressed(
         output_dir / "heatmaps.npz",
-        dominant_counts=dominant_counts,
+        global_counts=global_counts.astype(np.float32),
+        dominant_counts=dominant_counts.astype(np.float32),
+        dominant_chunk_counts=dominant_chunk_counts.astype(np.float32),
         dominant_reliability=dominant_reliability.astype(np.float32),
+        dominant_chunk_reliability=dominant_chunk_reliability.astype(np.float32),
+        dominant_other_reliability=dominant_other_reliability.astype(np.float32),
         extent=np.asarray(extent, dtype=np.float64),
         resolution=np.asarray(resolution, dtype=np.float64),
         dominant_cameras=np.asarray(dominant_cameras, dtype=np.int32),
