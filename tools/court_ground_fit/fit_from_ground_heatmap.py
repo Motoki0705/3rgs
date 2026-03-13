@@ -67,6 +67,7 @@ class ClusterSummary:
 class HeatmapData:
     counts: np.ndarray
     weights: np.ndarray
+    reliability: np.ndarray
     clean_mask: np.ndarray
     dt_to_data: np.ndarray
     data_rows: np.ndarray
@@ -149,6 +150,7 @@ def build_ground_segments() -> tuple[np.ndarray, list[tuple[int, int]]]:
 
 def build_weighted_heatmap(
     counts: np.ndarray,
+    reliability: np.ndarray,
     extent: tuple[float, float, float, float],
     resolution: float,
     threshold_quantile: float,
@@ -158,6 +160,10 @@ def build_weighted_heatmap(
 ) -> HeatmapData:
     if counts.size == 0:
         raise ValueError("Heatmap counts are empty.")
+    if reliability.shape != counts.shape:
+        raise ValueError(
+            f"Reliability map shape must match counts shape, got {reliability.shape} vs {counts.shape}"
+        )
 
     weights = np.log1p(counts.astype(np.float32))
     max_weight = float(weights.max())
@@ -206,6 +212,7 @@ def build_weighted_heatmap(
     return HeatmapData(
         counts=counts.astype(np.uint16, copy=False),
         weights=weights,
+        reliability=np.asarray(reliability, dtype=np.float32),
         clean_mask=clean_mask.astype(bool),
         dt_to_data=dt_to_data,
         data_rows=data_rows.astype(np.int32),
@@ -322,7 +329,9 @@ def evaluate_params(
             data_pixels=int(heatmap.data_rows.size),
         )
 
-    forward_loss = float(heatmap.dt_to_data[model_pixels].mean())
+    reliability_weights = heatmap.reliability[model_pixels].astype(np.float32)
+    forward_denom = float(reliability_weights.sum()) + 1.0e-8
+    forward_loss = float(np.sum(reliability_weights * heatmap.dt_to_data[model_pixels]) / forward_denom)
     if heatmap.data_rows.size > 0:
         dt_to_model = cv2.distanceTransform((model_mask == 0).astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32)
         values = dt_to_model[heatmap.data_rows, heatmap.data_cols]
@@ -526,23 +535,37 @@ def render_overlay(heatmap: HeatmapData, fit: FitResult, direction: str, line_th
 
 def load_projected_ground_artifacts(
     ground_dir: Path,
-) -> tuple[list[str], list[np.ndarray], dict[str, np.ndarray | float], dict[str, Any]]:
+) -> tuple[list[str], list[np.ndarray], np.ndarray, dict[str, np.ndarray | float], dict[str, Any]]:
     plane_frame_path = ground_dir / "plane_frame.json"
     projected_train_path = ground_dir / "projected_train.npz"
+    raster_grid_path = ground_dir / "raster_grid.json"
+    visibility_train_path = ground_dir / "visibility_train.npz"
     if not plane_frame_path.exists():
         raise FileNotFoundError(f"Missing plane frame artifact: {plane_frame_path}")
     if not projected_train_path.exists():
         raise FileNotFoundError(f"Missing projected UV artifact: {projected_train_path}")
+    if not raster_grid_path.exists():
+        raise FileNotFoundError(f"Missing raster grid artifact: {raster_grid_path}")
+    if not visibility_train_path.exists():
+        raise FileNotFoundError(f"Missing visibility artifact: {visibility_train_path}")
 
     plane_frame = json.loads(plane_frame_path.read_text(encoding="utf-8"))
+    raster_grid = json.loads(raster_grid_path.read_text(encoding="utf-8"))
     projected = np.load(projected_train_path)
+    visibility = np.load(visibility_train_path)
     uv_points = np.asarray(projected["uv_points"], dtype=np.float32)
     uv_offsets = np.asarray(projected["uv_offsets"], dtype=np.int64)
     train_stems = projected["train_stems"].astype(str).tolist()
+    confidence_maps = np.asarray(visibility["confidence_maps"], dtype=np.float32)
     if uv_offsets.shape[0] != len(train_stems) + 1:
         raise ValueError(
             "Projected UV offsets do not match train stem count: "
             f"offsets={uv_offsets.shape[0]} stems={len(train_stems)}"
+        )
+    if confidence_maps.shape[0] != len(train_stems):
+        raise ValueError(
+            "Confidence map count does not match train stem count: "
+            f"confidence={confidence_maps.shape[0]} stems={len(train_stems)}"
         )
 
     projected_uvs: list[np.ndarray] = []
@@ -561,9 +584,12 @@ def load_projected_ground_artifacts(
         "mast3r_dir": plane_frame.get("mast3r_dir"),
         "scene_dir": plane_frame.get("scene_dir"),
     }
-    return train_stems, projected_uvs, ground, {
+    return train_stems, projected_uvs, confidence_maps, ground, {
         "plane_frame_path": str(plane_frame_path),
         "projected_train_path": str(projected_train_path),
+        "raster_grid_path": str(raster_grid_path),
+        "visibility_train_path": str(visibility_train_path),
+        "raster_grid": raster_grid,
         "plane_frame": plane_frame,
     }
 
@@ -596,8 +622,19 @@ def build_counts_for_cameras(
     return rasterize_uv(merged, extent, resolution)
 
 
+def build_reliability_for_cameras(
+    confidence_maps: np.ndarray,
+    camera_indices: list[int],
+) -> np.ndarray:
+    if not camera_indices:
+        return np.zeros(confidence_maps.shape[1:], dtype=np.float32)
+    selected = np.clip(confidence_maps[camera_indices].astype(np.float32), 0.0, 1.0)
+    return 1.0 - np.prod(1.0 - selected, axis=0, dtype=np.float32)
+
+
 def fit_single_heatmap(
     counts: np.ndarray,
+    reliability: np.ndarray,
     extent: tuple[float, float, float, float],
     resolution: float,
     init_params: dict[str, float],
@@ -607,6 +644,7 @@ def fit_single_heatmap(
 ) -> tuple[HeatmapData, FitResult]:
     heatmap = build_weighted_heatmap(
         counts,
+        reliability,
         extent,
         resolution,
         threshold_quantile=args.weight_threshold_quantile,
@@ -901,10 +939,11 @@ def main() -> None:
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading projected ground-plane court-line artifacts...", flush=True)
-    train_stems, projected_uvs, ground, ground_inputs = load_projected_ground_artifacts(ground_dir)
+    train_stems, projected_uvs, confidence_maps, ground, ground_inputs = load_projected_ground_artifacts(ground_dir)
     mast3r_dir = Path(str(ground["mast3r_dir"])).expanduser().resolve() if ground.get("mast3r_dir") else scene_dir / "mast3r"
-    all_uv = np.concatenate([uv for uv in projected_uvs if uv.size > 0], axis=0)
-    extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
+    raster_grid = ground_inputs["raster_grid"]
+    extent = tuple(float(v) for v in raster_grid["extent_xy"])
+    resolution = float(raster_grid["resolution"])
     init_params, adjacent_court_direction, init_sim3_payload = load_init_sim3_seed(
         init_sim3_path,
         ground,
@@ -921,7 +960,8 @@ def main() -> None:
         if end - start < 2:
             continue
         camera_indices = list(range(start, end))
-        counts = build_counts_for_cameras(projected_uvs, camera_indices, extent, args.grid_resolution)
+        counts = build_counts_for_cameras(projected_uvs, camera_indices, extent, resolution)
+        reliability = build_reliability_for_cameras(confidence_maps, camera_indices)
         projected_pixels = int(np.sum(counts, dtype=np.float64))
         if projected_pixels <= 0:
             continue
@@ -931,8 +971,9 @@ def main() -> None:
             extra_seeds.append(previous_fit.params)
         chunk_heatmap, chunk_fit = fit_single_heatmap(
             counts,
+            reliability,
             extent,
-            args.grid_resolution,
+            resolution,
             init_params=chunk_init,
             args=fit_args,
             stage=f"chunk_{chunk_index:03d}",
@@ -972,7 +1013,8 @@ def main() -> None:
         dominant_label = int(best_chunk.cluster)
         dominant_cameras = list(best_chunk.camera_indices)
 
-    dominant_counts = build_counts_for_cameras(projected_uvs, dominant_cameras, extent, args.grid_resolution)
+    dominant_counts = build_counts_for_cameras(projected_uvs, dominant_cameras, extent, resolution)
+    dominant_reliability = build_reliability_for_cameras(confidence_maps, dominant_cameras)
     best_chunk = min(chunk_records, key=lambda record: record.fit.total_loss)
     dominant_init = best_chunk.fit.params
     dominant_member_records = [record for record in chunk_records if record.cluster == dominant_label]
@@ -984,8 +1026,9 @@ def main() -> None:
     print(f"Refitting on dominant-cluster cameras ({len(dominant_cameras)} cameras)...", flush=True)
     dominant_heatmap, final_fit = fit_single_heatmap(
         dominant_counts,
+        dominant_reliability,
         extent,
-        args.grid_resolution,
+        resolution,
         init_params=dominant_init,
         args=fit_args,
         stage="dominant_cluster_final",
@@ -1001,9 +1044,10 @@ def main() -> None:
     if not np.isfinite(final_fit.total_loss):
         selected_fit = best_chunk.fit
         selected_heatmap, _ = fit_single_heatmap(
-            build_counts_for_cameras(projected_uvs, best_chunk.camera_indices, extent, args.grid_resolution),
+            build_counts_for_cameras(projected_uvs, best_chunk.camera_indices, extent, resolution),
+            build_reliability_for_cameras(confidence_maps, best_chunk.camera_indices),
             extent,
-            args.grid_resolution,
+            resolution,
             init_params=best_chunk.fit.params,
             args=fit_args,
             stage="best_chunk_fallback",
@@ -1024,6 +1068,8 @@ def main() -> None:
         "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
+        "raster_grid_path": ground_inputs["raster_grid_path"],
+        "visibility_train_path": ground_inputs["visibility_train_path"],
         "adjacent_court_direction": adjacent_court_direction,
         "seed_sim3": init_sim3_payload,
         "selected_fit_source": selected_fit_source,
@@ -1048,6 +1094,8 @@ def main() -> None:
         "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
+        "raster_grid_path": ground_inputs["raster_grid_path"],
+        "visibility_train_path": ground_inputs["visibility_train_path"],
         "transform_dir": str(transform_dir),
         "debug_output_dir": str(output_dir),
         "fit_result_path": str(fit_result_path),
@@ -1062,12 +1110,14 @@ def main() -> None:
         "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
+        "raster_grid_path": ground_inputs["raster_grid_path"],
+        "visibility_train_path": ground_inputs["visibility_train_path"],
         "output_dir": str(output_dir),
         "transform_dir": str(transform_dir),
         "adjacent_court_direction": adjacent_court_direction,
         "seed_sim3": init_sim3_payload,
         "extent_xy": [float(v) for v in extent],
-        "grid_resolution": float(args.grid_resolution),
+        "grid_resolution": float(resolution),
         "ground_plane": {
             "normal": np.asarray(ground["plane_normal"], dtype=np.float64).tolist(),
             "d": float(ground["plane_d"]),
@@ -1104,8 +1154,9 @@ def main() -> None:
     np.savez_compressed(
         output_dir / "heatmaps.npz",
         dominant_counts=dominant_counts,
+        dominant_reliability=dominant_reliability.astype(np.float32),
         extent=np.asarray(extent, dtype=np.float64),
-        resolution=np.asarray(args.grid_resolution, dtype=np.float64),
+        resolution=np.asarray(resolution, dtype=np.float64),
         dominant_cameras=np.asarray(dominant_cameras, dtype=np.int32),
     )
 

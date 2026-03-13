@@ -41,6 +41,11 @@ class CameraProjectionSummary:
     x_max: float | None
     y_min: float | None
     y_max: float | None
+    footprint_pixels: int = 0
+    footprint_area_m2: float = 0.0
+    sigma_m: float | None = None
+    center_u: float | None = None
+    center_v: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +112,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200_000,
         help="Maximum number of projected 3D points to store in the merged sample NPZ.",
+    )
+    parser.add_argument(
+        "--confidence-sigma-scale",
+        type=float,
+        default=0.45,
+        help="Sigma scale relative to the equivalent radius of the visible footprint area.",
+    )
+    parser.add_argument(
+        "--confidence-sigma-min",
+        type=float,
+        default=2.0,
+        help="Minimum Gaussian sigma for per-camera confidence maps, in meters.",
+    )
+    parser.add_argument(
+        "--confidence-sigma-max",
+        type=float,
+        default=20.0,
+        help="Maximum Gaussian sigma for per-camera confidence maps, in meters.",
     )
     return parser.parse_args()
 
@@ -263,6 +286,96 @@ def rasterize_uv(uv: np.ndarray, extent: tuple[float, float, float, float], reso
     return counts
 
 
+def grid_shape_from_extent(extent: tuple[float, float, float, float], resolution: float) -> tuple[int, int]:
+    x_min, x_max, y_min, y_max = extent
+    width = int(math.ceil((x_max - x_min) / resolution)) + 1
+    height = int(math.ceil((y_max - y_min) / resolution)) + 1
+    return height, width
+
+
+def build_plane_grid(
+    extent: tuple[float, float, float, float],
+    resolution: float,
+    origin: np.ndarray,
+    axis_x: np.ndarray,
+    axis_y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    height, width = grid_shape_from_extent(extent, resolution)
+    x_min, _, _, y_max = extent
+    cols = x_min + (np.arange(width, dtype=np.float64) + 0.5) * resolution
+    rows = y_max - (np.arange(height, dtype=np.float64) + 0.5) * resolution
+    grid_u, grid_v = np.meshgrid(cols, rows)
+    uv = np.column_stack((grid_u.reshape(-1), grid_v.reshape(-1))).astype(np.float32)
+    xyz = (
+        origin[None, :]
+        + uv[:, 0:1].astype(np.float64) * axis_x[None, :]
+        + uv[:, 1:2].astype(np.float64) * axis_y[None, :]
+    ).astype(np.float32)
+    return uv, xyz, (height, width)
+
+
+def invert_c2w(c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rotation = c2w[:3, :3].astype(np.float64)
+    translation = c2w[:3, 3].astype(np.float64)
+    world_to_camera_rotation = rotation.T
+    world_to_camera_translation = -world_to_camera_rotation @ translation
+    return world_to_camera_rotation, world_to_camera_translation
+
+
+def project_camera_center_to_plane_uv(
+    cam_center: np.ndarray,
+    plane_normal: np.ndarray,
+    plane_d: float,
+    origin: np.ndarray,
+    axis_x: np.ndarray,
+    axis_y: np.ndarray,
+) -> np.ndarray:
+    projected = cam_center - (float(np.dot(cam_center, plane_normal)) - plane_d) * plane_normal
+    rel = projected - origin
+    return np.array([float(np.dot(rel, axis_x)), float(np.dot(rel, axis_y))], dtype=np.float32)
+
+
+def compute_camera_confidence_map(
+    world_points: np.ndarray,
+    plane_uv: np.ndarray,
+    grid_shape: tuple[int, int],
+    c2w: np.ndarray,
+    K_full: np.ndarray,
+    image_width: int,
+    image_height: int,
+    center_uv: np.ndarray,
+    resolution: float,
+    sigma_scale: float,
+    sigma_min: float,
+    sigma_max: float,
+) -> tuple[np.ndarray, int, float]:
+    world_to_camera_rotation, world_to_camera_translation = invert_c2w(c2w)
+    cam_points = world_points.astype(np.float64) @ world_to_camera_rotation.T + world_to_camera_translation[None, :]
+    z = cam_points[:, 2]
+    valid = z > 1.0e-6
+    if np.any(valid):
+        u = np.empty_like(z)
+        v = np.empty_like(z)
+        u[valid] = K_full[0, 0] * (cam_points[valid, 0] / z[valid]) + K_full[0, 2]
+        v[valid] = K_full[1, 1] * (cam_points[valid, 1] / z[valid]) + K_full[1, 2]
+        valid &= (u >= 0.0) & (u <= float(image_width - 1)) & (v >= 0.0) & (v <= float(image_height - 1))
+
+    footprint_pixels = int(valid.sum())
+    if footprint_pixels <= 0:
+        return np.zeros(grid_shape, dtype=np.float16), 0, float(sigma_min)
+
+    footprint_area = footprint_pixels * (resolution ** 2)
+    equivalent_radius = math.sqrt(max(footprint_area, resolution ** 2) / math.pi)
+    sigma_m = float(np.clip(equivalent_radius * sigma_scale, sigma_min, sigma_max))
+
+    delta_u = plane_uv[:, 0].astype(np.float64) - float(center_uv[0])
+    delta_v = plane_uv[:, 1].astype(np.float64) - float(center_uv[1])
+    dist2 = delta_u * delta_u + delta_v * delta_v
+    confidence = np.zeros((plane_uv.shape[0],), dtype=np.float32)
+    confidence[valid] = np.exp((-0.5 * dist2[valid]) / max(sigma_m * sigma_m, 1.0e-8)).astype(np.float32)
+    return confidence.reshape(grid_shape).astype(np.float16), footprint_pixels, sigma_m
+
+
 def write_binary_image(path: Path, counts: np.ndarray) -> None:
     binary = np.where(counts > 0, 255, 0).astype(np.uint8)
     cv2.imwrite(str(path), binary)
@@ -277,6 +390,12 @@ def write_heatmap_image(path: Path, counts: np.ndarray) -> None:
     scaled /= float(scaled.max())
     heat_uint8 = np.clip(np.round(255.0 * scaled), 0, 255).astype(np.uint8)
     colored = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_TURBO)
+    cv2.imwrite(str(path), colored)
+
+
+def write_confidence_image(path: Path, confidence: np.ndarray) -> None:
+    scaled = np.clip(np.round(255.0 * np.asarray(confidence, dtype=np.float32)), 0, 255).astype(np.uint8)
+    colored = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
     cv2.imwrite(str(path), colored)
 
 
@@ -353,6 +472,7 @@ def main() -> None:
     ground_dir = args.ground_dir.expanduser().resolve() if args.ground_dir is not None else scene_dir / "court" / "ground"
     output_dir = args.output_dir.expanduser().resolve()
     per_camera_dir = output_dir / "per_camera"
+    reliability_dir = output_dir / "reliability"
 
     if not mast3r_dir.exists():
         raise FileNotFoundError(f"Missing MASt3R directory: {mast3r_dir}")
@@ -385,6 +505,7 @@ def main() -> None:
     ground_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     per_camera_dir.mkdir(parents=True, exist_ok=True)
+    reliability_dir.mkdir(parents=True, exist_ok=True)
 
     print("Estimating ground plane and in-plane basis...", flush=True)
     ground = estimate_ground_frame(
@@ -459,6 +580,9 @@ def main() -> None:
     all_xyz = np.concatenate([xyz for xyz in projected_xyzs if xyz.size > 0], axis=0)
     extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
     packed_uv, packed_offsets = pack_projected_uvs(projected_uvs)
+    grid_uv, grid_world, grid_shape = build_plane_grid(extent, args.grid_resolution, origin, axis_x, axis_y)
+    reliability_maps: list[np.ndarray] = []
+    confidence_image_paths: list[Path] = []
 
     plane_frame_path = ground_dir / "plane_frame.json"
     plane_frame: dict[str, Any] = {
@@ -485,6 +609,14 @@ def main() -> None:
         image_size=np.asarray([full_height, full_width], dtype=np.int32),
     )
 
+    raster_grid_path = ground_dir / "raster_grid.json"
+    raster_grid = {
+        "extent_xy": [float(v) for v in extent],
+        "resolution": float(args.grid_resolution),
+        "shape_hw": [int(grid_shape[0]), int(grid_shape[1])],
+    }
+    raster_grid_path.write_text(json.dumps(raster_grid, indent=2), encoding="utf-8")
+
     merged_counts = rasterize_uv(all_uv, extent, args.grid_resolution)
     np.savez_compressed(
         output_dir / "merged_projection_counts.npz",
@@ -496,18 +628,64 @@ def main() -> None:
     write_heatmap_image(output_dir / "merged_projection_heatmap.png", merged_counts)
 
     saved_camera_images: list[Path] = []
-    for summary, uv in zip(summaries, projected_uvs):
+    for cam_idx, (summary, uv) in enumerate(zip(summaries, projected_uvs)):
         counts = rasterize_uv(uv, extent, args.grid_resolution)
         binary_path = per_camera_dir / f"{summary.index:03d}_{summary.stem}.png"
         write_binary_image(binary_path, counts)
         saved_camera_images.append(binary_path)
 
+        K_full = scale_intrinsics_to_fullres(intrinsics[cam_idx], full_width, args.court_base_width)
+        center_uv = project_camera_center_to_plane_uv(
+            camera_poses[cam_idx, :3, 3].astype(np.float64),
+            plane_normal,
+            plane_d,
+            origin,
+            axis_x,
+            axis_y,
+        )
+        confidence_map, footprint_pixels, sigma_m = compute_camera_confidence_map(
+            grid_world,
+            grid_uv,
+            grid_shape,
+            camera_poses[cam_idx],
+            K_full,
+            full_width,
+            full_height,
+            center_uv,
+            args.grid_resolution,
+            sigma_scale=float(args.confidence_sigma_scale),
+            sigma_min=float(args.confidence_sigma_min),
+            sigma_max=float(args.confidence_sigma_max),
+        )
+        reliability_maps.append(confidence_map)
+        summary.footprint_pixels = footprint_pixels
+        summary.footprint_area_m2 = float(footprint_pixels * (args.grid_resolution ** 2))
+        summary.sigma_m = float(sigma_m)
+        summary.center_u = float(center_uv[0])
+        summary.center_v = float(center_uv[1])
+        confidence_path = reliability_dir / f"{summary.index:03d}_{summary.stem}.png"
+        write_confidence_image(confidence_path, confidence_map)
+        confidence_image_paths.append(confidence_path)
+
     build_contact_sheet(saved_camera_images, output_dir / "per_camera_contact_sheet.png")
+    build_contact_sheet(confidence_image_paths, output_dir / "reliability_contact_sheet.png")
     saved_points = maybe_save_point_sample(
         output_dir / "merged_projected_points_sample.npz",
         all_xyz,
         all_uv,
         args.max_saved_points,
+    )
+
+    visibility_train_path = ground_dir / "visibility_train.npz"
+    np.savez_compressed(
+        visibility_train_path,
+        confidence_maps=np.stack(reliability_maps, axis=0).astype(np.float16),
+        camera_center_uv=np.asarray([[item.center_u, item.center_v] for item in summaries], dtype=np.float32),
+        sigma_m=np.asarray(
+            [item.sigma_m if item.sigma_m is not None else float(args.confidence_sigma_min) for item in summaries],
+            dtype=np.float32,
+        ),
+        train_stems=np.asarray(train_stems, dtype=str),
     )
 
     manifest: dict[str, Any] = {
@@ -517,6 +695,8 @@ def main() -> None:
         "ground_dir": str(ground_dir),
         "debug_output_dir": str(output_dir),
         "image_size": [full_height, full_width],
+        "raster_grid_path": str(raster_grid_path),
+        "visibility_train_path": str(visibility_train_path),
         "plane": {
             "normal": plane_normal.tolist(),
             "d": plane_d,
@@ -529,6 +709,7 @@ def main() -> None:
             "total_mask_pixels": int(sum(item.mask_pixels for item in summaries)),
             "total_projected_pixels": int(sum(item.projected_pixels for item in summaries)),
             "packed_uv_points": int(packed_uv.shape[0]),
+            "total_footprint_pixels": int(sum(item.footprint_pixels for item in summaries)),
         },
         "cameras": [asdict(item) for item in summaries],
     }
@@ -539,13 +720,16 @@ def main() -> None:
         "extent_xy": [float(v) for v in extent],
         "merged_point_sample_saved": int(saved_points),
         "merged_heatmap_max_count": int(merged_counts.max()),
+        "mean_confidence_max": float(np.mean([float(np.max(item)) for item in reliability_maps])) if reliability_maps else 0.0,
     }
     (output_dir / "metadata.json").write_text(json.dumps(debug_metadata, indent=2), encoding="utf-8")
 
     print(f"Saved merged heatmap to {output_dir / 'merged_projection_heatmap.png'}", flush=True)
     print(f"Saved {len(saved_camera_images)} per-camera top-down masks to {per_camera_dir}", flush=True)
     print(f"Saved plane frame to {plane_frame_path}", flush=True)
+    print(f"Saved raster grid to {raster_grid_path}", flush=True)
     print(f"Saved projected UVs to {projected_train_path}", flush=True)
+    print(f"Saved confidence maps to {visibility_train_path}", flush=True)
     print(f"Saved manifest to {ground_dir / 'manifest.json'}", flush=True)
 
 

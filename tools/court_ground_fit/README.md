@@ -18,6 +18,8 @@
 
 - `<scene_dir>/court/ground/plane_frame.json`
 - `<scene_dir>/court/ground/projected_train.npz`
+- `<scene_dir>/court/ground/raster_grid.json`
+- `<scene_dir>/court/ground/visibility_train.npz`
 - `<scene_dir>/court/transform/init_sim3.json`
 
 デフォルトの対象シーンは以下です。
@@ -30,6 +32,8 @@
 
 - `<scene_dir>/court/ground/plane_frame.json`
 - `<scene_dir>/court/ground/projected_train.npz`
+- `<scene_dir>/court/ground/raster_grid.json`
+- `<scene_dir>/court/ground/visibility_train.npz`
 - `<scene_dir>/court/ground/manifest.json`
 - `<scene_dir>/court/transform/ground_heatmap_fit.json`
 - `<scene_dir>/court/transform/ground_heatmap_fit_sim3.json`
@@ -86,12 +90,16 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 - 正規成果物
   - `data/.../court/ground/plane_frame.json`
   - `data/.../court/ground/projected_train.npz`
+  - `data/.../court/ground/raster_grid.json`
+  - `data/.../court/ground/visibility_train.npz`
   - `data/.../court/ground/manifest.json`
 - デバッグ成果物
   - `results/.../court/ground/merged_projection_heatmap.png`
   - `results/.../court/ground/merged_projection_binary.png`
   - `results/.../court/ground/per_camera/*.png`
   - `results/.../court/ground/per_camera_contact_sheet.png`
+  - `results/.../court/ground/reliability/*.png`
+  - `results/.../court/ground/reliability_contact_sheet.png`
   - `results/.../court/ground/metadata.json`
 
 ## 出力の見方
@@ -106,6 +114,8 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 ## 注意
 
 - `fit_from_ground_heatmap.py` は `project_court_lines_to_ground.py` の成果物を直接読み込みます。
+- `project_court_lines_to_ground.py` は共通 raster grid と per-camera reliability map を生成します。
+- `fit_from_ground_heatmap.py` の forward loss は chunk reliability map で重み付けされます。
 - `fit_from_ground_heatmap.py` は `court/transform/init_sim3.json` を seed として読み込み、`CourtInitEstimator` は呼びません。
 - この fit は画像平面ではなく、推定された地面平面上で行います。
 - chunk clustering は、カメラポーズのドリフトの影響を減らすために入れています。
