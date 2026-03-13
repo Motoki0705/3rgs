@@ -20,6 +20,7 @@ DEFAULT_PYTHON_PACKAGES = [
     "wheel",
     "ninja",
 ]
+_RUNTIME_PYTHON: Path | None = None
 PHASES = [
     "mount_drive",
     "python_deps",
@@ -57,11 +58,39 @@ def mount_drive(mount_point: Path, force_remount: bool) -> None:
     drive.mount(str(mount_point), force_remount=force_remount)
 
 
+def candidate_python_paths() -> list[Path]:
+    candidates = [
+        os.environ.get("COLAB_PYTHON"),
+        os.environ.get("PYTHON"),
+        shutil.which("python"),
+        shutil.which("python3"),
+        sys.executable,
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if not resolved.exists() or resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
+
+
 def install_python_deps(repo_dir: Path) -> None:
-    run([sys.executable, "-m", "pip", "install", "--upgrade", *DEFAULT_PYTHON_PACKAGES])
+    runtime_python = select_runtime_python()
+    run([str(runtime_python), "-m", "pip", "install", "--upgrade", *DEFAULT_PYTHON_PACKAGES])
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "-m",
             "pip",
             "install",
@@ -69,10 +98,10 @@ def install_python_deps(repo_dir: Path) -> None:
             "torchvision==0.25.0",
         ]
     )
-    run([sys.executable, "-m", "pip", "install", "-r", str(repo_dir / "requirements.txt")])
+    run([str(runtime_python), "-m", "pip", "install", "-r", str(repo_dir / "requirements.txt")])
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "-m",
             "pip",
             "install",
@@ -82,7 +111,7 @@ def install_python_deps(repo_dir: Path) -> None:
     )
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "-m",
             "pip",
             "install",
@@ -90,14 +119,17 @@ def install_python_deps(repo_dir: Path) -> None:
             str(repo_dir / "third_party" / "mast3r" / "requirements.txt"),
         ]
     )
-    ensure_mast3r_python_shim(repo_dir)
+    ensure_mast3r_python_shim(repo_dir, runtime_python)
 
 
-def ensure_mast3r_python_shim(repo_dir: Path) -> Path:
+def ensure_mast3r_python_shim(repo_dir: Path, target_python: Path | None = None) -> Path:
     mast3r_repo = repo_dir / "third_party" / "mast3r"
     bin_dir = mast3r_repo / ".venv" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    target_python = Path(sys.executable).resolve()
+    if target_python is None:
+        target_python = select_runtime_python()
+    else:
+        target_python = target_python.resolve()
     for name in ("python", "python3"):
         link_path = bin_dir / name
         if link_path.exists() or link_path.is_symlink():
@@ -105,6 +137,38 @@ def ensure_mast3r_python_shim(repo_dir: Path) -> Path:
         link_path.symlink_to(target_python)
     print(f"Created MASt3R python shim: {bin_dir / 'python'} -> {target_python}", flush=True)
     return bin_dir / "python"
+
+
+def python_can_import(python_path: Path, modules: list[str]) -> bool:
+    code = "import " + ", ".join(modules)
+    try:
+        subprocess.run([str(python_path), "-c", code], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return True
+
+
+def select_runtime_python() -> Path:
+    global _RUNTIME_PYTHON
+    if _RUNTIME_PYTHON is not None and _RUNTIME_PYTHON.exists():
+        return _RUNTIME_PYTHON
+
+    candidates = candidate_python_paths()
+    preference_tiers = [
+        ["numpy", "torch", "pip"],
+        ["numpy", "pip"],
+        ["pip"],
+    ]
+    for modules in preference_tiers:
+        for candidate in candidates:
+            if python_can_import(candidate, modules):
+                _RUNTIME_PYTHON = candidate
+                print(f"Using runtime Python: {candidate}", flush=True)
+                return candidate
+    raise RuntimeError(
+        "No usable Python interpreter found for Colab runtime. "
+        "Expected a Python that can at least import pip."
+    )
 
 
 def copy_tar_to_local(src_tar: Path, local_tar: Path, overwrite: bool) -> None:
@@ -208,9 +272,16 @@ def has_pose_opt_outputs(scene_root: Path) -> bool:
 
 
 def run_mast3r_preprocess(repo_dir: Path, data_link: Path) -> None:
+    runtime_python = select_runtime_python()
+    mast3r_python = ensure_mast3r_python_shim(repo_dir, runtime_python)
+    if not python_can_import(mast3r_python, ["numpy", "torch"]):
+        print("MASt3R python shim is missing required modules; reinstalling Python dependencies.", flush=True)
+        install_python_deps(repo_dir)
+        runtime_python = select_runtime_python()
+        mast3r_python = ensure_mast3r_python_shim(repo_dir, runtime_python)
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "scripts/preprocess.py",
             "--scene_dir",
             str(data_link),
@@ -223,9 +294,10 @@ def run_mast3r_preprocess(repo_dir: Path, data_link: Path) -> None:
 
 
 def run_court_ground_fit(repo_dir: Path, data_link: Path) -> None:
+    runtime_python = select_runtime_python()
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "tools/court_ground_fit/project_court_lines_to_ground.py",
             "--scene-dir",
             str(data_link),
@@ -234,7 +306,7 @@ def run_court_ground_fit(repo_dir: Path, data_link: Path) -> None:
     )
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "tools/court_ground_fit/fit_from_ground_heatmap.py",
             "--scene-dir",
             str(data_link),
@@ -244,9 +316,10 @@ def run_court_ground_fit(repo_dir: Path, data_link: Path) -> None:
 
 
 def run_pose_optimization(repo_dir: Path, data_link: Path) -> None:
+    runtime_python = select_runtime_python()
     run(
         [
-            sys.executable,
+            str(runtime_python),
             "tools/court_ground_fit/optimize_camera_poses_to_fixed_sim3.py",
             "--scene-dir",
             str(data_link),
@@ -267,6 +340,7 @@ def install_optimized_training_poses(scene_root: Path) -> Path:
 
 
 def verify_runtime(repo_dir: Path) -> None:
+    runtime_python = select_runtime_python()
     env = os.environ.copy()
     env.setdefault("MPLBACKEND", "Agg")
     code = """
@@ -278,14 +352,15 @@ print('cuda_available', torch.cuda.is_available())
 print('torch_cuda', torch.version.cuda)
 print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')
 """
-    run([sys.executable, "-c", code], cwd=repo_dir, env=env)
+    run([str(runtime_python), "-c", code], cwd=repo_dir, env=env)
 
 
 def train(repo_dir: Path, data_link: Path, args: argparse.Namespace) -> None:
+    runtime_python = select_runtime_python()
     result_dir = Path(args.result_dir).expanduser()
     result_dir.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable,
+        str(runtime_python),
         "src/trainer.py",
         args.train_mode,
         "--data_dir",
