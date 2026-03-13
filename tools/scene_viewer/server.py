@@ -498,7 +498,7 @@ def main():
         "--output",
         default=None,
         help="[court-init mode] Output path for init_sim3.json. "
-             "Defaults to <scene-dir>/mast3r/court_alignment/init_sim3.json",
+             "Defaults to <scene-dir>/court/transform/init_sim3.json",
     )
     parser.add_argument(
         "--adjacent-direction",
@@ -543,7 +543,7 @@ def main():
             if not out_path.is_absolute():
                 out_path = REPO_ROOT / out_path
         else:
-            out_path = mast3r_dir / "court_alignment" / "init_sim3.json"
+            out_path = scene_dir / "court" / "transform" / "init_sim3.json"
         COURT_INIT_OUTPUT_PATH = out_path.resolve()
 
         # Run estimator

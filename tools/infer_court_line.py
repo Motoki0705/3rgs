@@ -7,13 +7,13 @@ Preprocessing matches `experiments/court_detection/configs/line.py` validation:
 - round height/width down to multiples of 8
 - normalize with ImageNet mean/std
 
-Outputs are written under the requested output directory:
+Debug artifacts are written under the requested output directory:
 - `masks/<stem>.png`: binary mask at the original image resolution
-- `manifest.json`: run metadata
 
 If a scene directory is provided, the script also writes:
-- `mast3r/court_line_masks.npy`: cleaned train-split masks stacked in
+- `court/line/court_line_masks.npy`: cleaned train-split masks stacked in
   `images_train.txt` order
+- `court/line/manifest.json`: run metadata for downstream tools
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class InferenceConfig:
     checkpoint: Path
     output_dir: Path
     scene_dir: Path | None = None
-    mast3r_output_path: Path | None = None
+    court_output_path: Path | None = None
     batch_size: int = 32
     short_side: int = 288
     threshold: float = 0.5
@@ -79,7 +79,7 @@ def parse_args() -> InferenceConfig:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/root/repos/3rgs/results"),
+        default=Path("/root/repos/3rgs/results/tennis_court/court/line"),
     )
     parser.add_argument(
         "--scene-dir",
@@ -88,10 +88,16 @@ def parse_args() -> InferenceConfig:
         help="Scene root containing images_train.txt and mast3r/.",
     )
     parser.add_argument(
+        "--court-output-path",
+        type=Path,
+        default=None,
+        help="Override the .npy output path. Defaults to <scene-dir>/court/line/court_line_masks.npy.",
+    )
+    parser.add_argument(
         "--mast3r-output-path",
         type=Path,
         default=None,
-        help="Override the .npy output path. Defaults to <scene-dir>/mast3r/court_line_masks.npy.",
+        help="Deprecated alias for --court-output-path.",
     )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--short-side", type=int, default=288)
@@ -111,10 +117,14 @@ def parse_args() -> InferenceConfig:
         checkpoint=args.checkpoint.expanduser().resolve(),
         output_dir=args.output_dir.expanduser().resolve(),
         scene_dir=args.scene_dir.expanduser().resolve() if args.scene_dir is not None else None,
-        mast3r_output_path=(
-            args.mast3r_output_path.expanduser().resolve()
-            if args.mast3r_output_path is not None
-            else None
+        court_output_path=(
+            args.court_output_path.expanduser().resolve()
+            if args.court_output_path is not None
+            else (
+                args.mast3r_output_path.expanduser().resolve()
+                if args.mast3r_output_path is not None
+                else None
+            )
         ),
         batch_size=args.batch_size,
         short_side=args.short_side,
@@ -268,12 +278,12 @@ def clean_upper_half(mask: np.ndarray) -> np.ndarray:
     return cleaned
 
 
-def resolve_mast3r_output_path(cfg: InferenceConfig) -> Path | None:
-    if cfg.mast3r_output_path is not None:
-        return cfg.mast3r_output_path
+def resolve_court_output_path(cfg: InferenceConfig) -> Path | None:
+    if cfg.court_output_path is not None:
+        return cfg.court_output_path
     if cfg.scene_dir is None:
         return None
-    return cfg.scene_dir / "mast3r" / "court_line_masks.npy"
+    return cfg.scene_dir / "court" / "line" / "court_line_masks.npy"
 
 
 def load_train_split(scene_dir: Path) -> list[str]:
@@ -290,7 +300,7 @@ def load_train_split(scene_dir: Path) -> list[str]:
 def main() -> None:
     cfg = parse_args()
     device = resolve_device(cfg.device)
-    mast3r_output_path = resolve_mast3r_output_path(cfg)
+    court_output_path = resolve_court_output_path(cfg)
     train_split = load_train_split(cfg.scene_dir) if cfg.scene_dir is not None else []
 
     dataset = CourtLineInferenceDataset(cfg.image_dir, cfg.short_side)
@@ -360,11 +370,11 @@ def main() -> None:
                     binary_mask = (mask > 0).astype(np.uint8)
                     if train_mask_memmap is None:
                         train_mask_shape = binary_mask.shape
-                        if mast3r_output_path is None:
-                            raise RuntimeError("Internal error: missing mast3r output path for train-split export.")
-                        mast3r_output_path.parent.mkdir(parents=True, exist_ok=True)
+                        if court_output_path is None:
+                            raise RuntimeError("Internal error: missing court output path for train-split export.")
+                        court_output_path.parent.mkdir(parents=True, exist_ok=True)
                         train_mask_memmap = open_memmap(
-                            mast3r_output_path,
+                            court_output_path,
                             mode="w+",
                             dtype=np.uint8,
                             shape=(len(train_split), train_mask_shape[0], train_mask_shape[1]),
@@ -389,7 +399,7 @@ def main() -> None:
         for future in futures:
             future.result()
 
-    if mast3r_output_path is not None:
+    if court_output_path is not None:
         if train_written is None or train_mask_memmap is None:
             raise RuntimeError("No train-split masks were written.")
         missing = [image_id for idx, image_id in enumerate(train_split) if not train_written[idx]]
@@ -411,17 +421,23 @@ def main() -> None:
         "upper_half_cleaned": True,
         "num_images": len(dataset),
         "scene_dir": str(cfg.scene_dir) if cfg.scene_dir is not None else None,
-        "mast3r_output_path": str(mast3r_output_path) if mast3r_output_path is not None else None,
+        "court_output_path": str(court_output_path) if court_output_path is not None else None,
+        "debug_output_dir": str(cfg.output_dir),
         "train_split_count": len(train_split),
         "items": manifest_items,
     }
-    manifest_path = cfg.output_dir / "manifest.json"
+    manifest_path = (
+        court_output_path.parent / "manifest.json"
+        if court_output_path is not None
+        else cfg.output_dir / "manifest.json"
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(f"Inference complete: {len(dataset)} images")
     print(f"Masks: {output_mask_dir}")
-    if mast3r_output_path is not None:
-        print(f"MASt3R masks: {mast3r_output_path}")
+    if court_output_path is not None:
+        print(f"Court masks: {court_output_path}")
     print(f"Manifest: {manifest_path}")
 
 

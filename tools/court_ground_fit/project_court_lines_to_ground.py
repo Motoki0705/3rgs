@@ -3,8 +3,9 @@
 
 This script treats each non-zero pixel in ``court_line_masks.npy`` as a projector
 pixel, casts a ray from the corresponding camera through that pixel, intersects
-the ray with the ground plane estimated from the MASt3R point cloud, and saves
-top-down visualizations under ``results/``.
+the ray with the ground plane estimated from the MASt3R point cloud, and writes
+minimal downstream artifacts under ``data/.../court/ground`` while saving debug
+visualizations under ``results/.../court/ground``.
 """
 from __future__ import annotations
 
@@ -60,12 +61,18 @@ def parse_args() -> argparse.Namespace:
         "--mask-path",
         type=Path,
         default=None,
-        help="Override court_line_masks.npy path. Defaults to <mast3r-dir>/court_line_masks.npy.",
+        help="Override court_line_masks.npy path. Defaults to <scene-dir>/court/line/court_line_masks.npy.",
+    )
+    parser.add_argument(
+        "--ground-dir",
+        type=Path,
+        default=None,
+        help="Directory for downstream ground-plane artifacts. Defaults to <scene-dir>/court/ground.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/tennis_court/court_line_ground_projection"),
+        default=Path("results/tennis_court/court/ground"),
         help="Directory for projected artifacts.",
     )
     parser.add_argument(
@@ -324,11 +331,26 @@ def maybe_save_point_sample(output_path: Path, points_xyz: np.ndarray, points_uv
     return int(sample_xyz.shape[0])
 
 
+def pack_projected_uvs(projected_uvs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    offsets = np.zeros((len(projected_uvs) + 1,), dtype=np.int64)
+    if not projected_uvs:
+        return np.empty((0, 2), dtype=np.float32), offsets
+
+    lengths = np.array([uv.shape[0] for uv in projected_uvs], dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths)
+    total = int(offsets[-1])
+    if total == 0:
+        return np.empty((0, 2), dtype=np.float32), offsets
+    packed = np.concatenate(projected_uvs, axis=0).astype(np.float32, copy=False)
+    return packed, offsets
+
+
 def main() -> None:
     args = parse_args()
     scene_dir = args.scene_dir.expanduser().resolve()
     mast3r_dir = args.mast3r_dir.expanduser().resolve() if args.mast3r_dir is not None else scene_dir / "mast3r"
-    mask_path = args.mask_path.expanduser().resolve() if args.mask_path is not None else mast3r_dir / "court_line_masks.npy"
+    mask_path = args.mask_path.expanduser().resolve() if args.mask_path is not None else scene_dir / "court" / "line" / "court_line_masks.npy"
+    ground_dir = args.ground_dir.expanduser().resolve() if args.ground_dir is not None else scene_dir / "court" / "ground"
     output_dir = args.output_dir.expanduser().resolve()
     per_camera_dir = output_dir / "per_camera"
 
@@ -360,6 +382,7 @@ def main() -> None:
         raise ValueError(f"Train stem count {len(train_stems)} does not match mask count {masks.shape[0]}")
 
     full_height, full_width = int(masks.shape[1]), int(masks.shape[2])
+    ground_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     per_camera_dir.mkdir(parents=True, exist_ok=True)
 
@@ -435,6 +458,32 @@ def main() -> None:
     all_uv = np.concatenate(non_empty_uvs, axis=0)
     all_xyz = np.concatenate([xyz for xyz in projected_xyzs if xyz.size > 0], axis=0)
     extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
+    packed_uv, packed_offsets = pack_projected_uvs(projected_uvs)
+
+    plane_frame_path = ground_dir / "plane_frame.json"
+    plane_frame: dict[str, Any] = {
+        "scene_dir": str(scene_dir),
+        "mast3r_dir": str(mast3r_dir),
+        "mask_path": str(mask_path),
+        "image_size": [full_height, full_width],
+        "plane": {
+            "normal": plane_normal.tolist(),
+            "d": plane_d,
+            "origin": origin.tolist(),
+            "axis_x": axis_x.tolist(),
+            "axis_y": axis_y.tolist(),
+        },
+    }
+    plane_frame_path.write_text(json.dumps(plane_frame, indent=2), encoding="utf-8")
+
+    projected_train_path = ground_dir / "projected_train.npz"
+    np.savez_compressed(
+        projected_train_path,
+        uv_points=packed_uv,
+        uv_offsets=packed_offsets,
+        train_stems=np.asarray(train_stems, dtype=str),
+        image_size=np.asarray([full_height, full_width], dtype=np.int32),
+    )
 
     merged_counts = rasterize_uv(all_uv, extent, args.grid_resolution)
     np.savez_compressed(
@@ -461,14 +510,13 @@ def main() -> None:
         args.max_saved_points,
     )
 
-    metadata: dict[str, Any] = {
+    manifest: dict[str, Any] = {
         "scene_dir": str(scene_dir),
         "mast3r_dir": str(mast3r_dir),
         "mask_path": str(mask_path),
-        "output_dir": str(output_dir),
+        "ground_dir": str(ground_dir),
+        "debug_output_dir": str(output_dir),
         "image_size": [full_height, full_width],
-        "grid_resolution": float(args.grid_resolution),
-        "extent_xy": [float(v) for v in extent],
         "plane": {
             "normal": plane_normal.tolist(),
             "d": plane_d,
@@ -480,16 +528,25 @@ def main() -> None:
             "camera_count": int(len(summaries)),
             "total_mask_pixels": int(sum(item.mask_pixels for item in summaries)),
             "total_projected_pixels": int(sum(item.projected_pixels for item in summaries)),
-            "merged_point_sample_saved": int(saved_points),
-            "merged_heatmap_max_count": int(merged_counts.max()),
+            "packed_uv_points": int(packed_uv.shape[0]),
         },
         "cameras": [asdict(item) for item in summaries],
     }
-    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (ground_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    debug_metadata = {
+        "grid_resolution": float(args.grid_resolution),
+        "extent_xy": [float(v) for v in extent],
+        "merged_point_sample_saved": int(saved_points),
+        "merged_heatmap_max_count": int(merged_counts.max()),
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(debug_metadata, indent=2), encoding="utf-8")
 
     print(f"Saved merged heatmap to {output_dir / 'merged_projection_heatmap.png'}", flush=True)
     print(f"Saved {len(saved_camera_images)} per-camera top-down masks to {per_camera_dir}", flush=True)
-    print(f"Saved metadata to {output_dir / 'metadata.json'}", flush=True)
+    print(f"Saved plane frame to {plane_frame_path}", flush=True)
+    print(f"Saved projected UVs to {projected_train_path}", flush=True)
+    print(f"Saved manifest to {ground_dir / 'manifest.json'}", flush=True)
 
 
 if __name__ == "__main__":

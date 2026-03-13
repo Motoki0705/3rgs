@@ -5,7 +5,7 @@ Pipeline:
 1. Project each camera's court-line mask onto the estimated ground plane.
 2. Fit the model on contiguous camera chunks.
 3. Cluster the chunk poses, refit on the dominant cluster, and export an
-   init_sim3.json-style result for later refinement.
+   final transform under ``data/.../court/transform``.
 """
 from __future__ import annotations
 
@@ -88,10 +88,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-dir", type=Path, default=Path("data/tennis_court"))
     parser.add_argument("--mast3r-dir", type=Path, default=None)
     parser.add_argument("--mask-path", type=Path, default=None)
+    parser.add_argument("--transform-dir", type=Path, default=None)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/tennis_court/court_ground_heatmap_fit"),
+        default=Path("results/tennis_court/court/transform"),
     )
     parser.add_argument("--adjacent-court-direction", choices=("+x", "-x", "+y", "-y"), default="+x")
     parser.add_argument("--court-base-width", type=float, default=512.0)
@@ -899,9 +900,11 @@ def main() -> None:
     args = parse_args()
     scene_dir = args.scene_dir.expanduser().resolve()
     mast3r_dir = args.mast3r_dir.expanduser().resolve() if args.mast3r_dir is not None else scene_dir / "mast3r"
-    mask_path = args.mask_path.expanduser().resolve() if args.mask_path is not None else mast3r_dir / "court_line_masks.npy"
+    mask_path = args.mask_path.expanduser().resolve() if args.mask_path is not None else scene_dir / "court" / "line" / "court_line_masks.npy"
+    transform_dir = args.transform_dir.expanduser().resolve() if args.transform_dir is not None else scene_dir / "court" / "transform"
     output_dir = args.output_dir.expanduser().resolve()
     chunk_dir = output_dir / "chunks"
+    transform_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1025,14 +1028,44 @@ def main() -> None:
         render_overlay(selected_heatmap, selected_fit, args.adjacent_court_direction, args.line_thickness_px),
     )
     sim3_payload = fit_to_sim3_payload(selected_fit, ground, args.adjacent_court_direction)
-    init_sim3_path = output_dir / "init_sim3_from_ground_heatmap.json"
-    init_sim3_path.write_text(json.dumps(sim3_payload, indent=2), encoding="utf-8")
+    fit_result_path = transform_dir / "ground_heatmap_fit.json"
+    fit_result = {
+        "scene_dir": str(scene_dir),
+        "mast3r_dir": str(mast3r_dir),
+        "mask_path": str(mask_path),
+        "adjacent_court_direction": args.adjacent_court_direction,
+        "selected_fit_source": selected_fit_source,
+        "dominant_cluster": int(dominant_label),
+        "dominant_cameras": dominant_cameras,
+        "params": selected_fit.params,
+        "loss": {
+            "total": float(selected_fit.total_loss),
+            "forward": float(selected_fit.forward_loss),
+            "backward": float(selected_fit.backward_loss),
+        },
+    }
+    fit_result_path.write_text(json.dumps(fit_result, indent=2), encoding="utf-8")
+
+    sim3_path = transform_dir / "ground_heatmap_fit_sim3.json"
+    sim3_path.write_text(json.dumps(sim3_payload, indent=2), encoding="utf-8")
+
+    transform_manifest = {
+        "scene_dir": str(scene_dir),
+        "mast3r_dir": str(mast3r_dir),
+        "mask_path": str(mask_path),
+        "transform_dir": str(transform_dir),
+        "debug_output_dir": str(output_dir),
+        "fit_result_path": str(fit_result_path),
+        "sim3_path": str(sim3_path),
+    }
+    (transform_dir / "manifest.json").write_text(json.dumps(transform_manifest, indent=2), encoding="utf-8")
 
     metadata = {
         "scene_dir": str(scene_dir),
         "mast3r_dir": str(mast3r_dir),
         "mask_path": str(mask_path),
         "output_dir": str(output_dir),
+        "transform_dir": str(transform_dir),
         "adjacent_court_direction": args.adjacent_court_direction,
         "extent_xy": [float(v) for v in extent],
         "grid_resolution": float(args.grid_resolution),
@@ -1064,7 +1097,8 @@ def main() -> None:
             for record in chunk_records
         ],
         "clusters": [asdict(summary) for summary in cluster_summaries],
-        "exported_init_sim3_path": str(init_sim3_path),
+        "fit_result_path": str(fit_result_path),
+        "sim3_path": str(sim3_path),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -1076,7 +1110,8 @@ def main() -> None:
         dominant_cameras=np.asarray(dominant_cameras, dtype=np.int32),
     )
 
-    print(f"Saved final init Sim(3) to {init_sim3_path}", flush=True)
+    print(f"Saved fit result to {fit_result_path}", flush=True)
+    print(f"Saved final Sim(3) to {sim3_path}", flush=True)
     print(f"Saved metadata to {output_dir / 'metadata.json'}", flush=True)
 
 
