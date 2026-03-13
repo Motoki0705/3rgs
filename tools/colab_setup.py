@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a cloned 3rgs checkout for Colab training from a minimal scene tar.
-
-Expected archive layout:
-- <scene_name>/images/*
-- <scene_name>/mast3r/court_line_masks.npy
-
-The script then runs `scripts/preprocess.py` inside Colab to generate the
-remaining MASt3R/3RGS metadata before launching training.
-"""
+"""Prepare a cloned 3rgs checkout for Colab training, including epipolar data."""
 
 from __future__ import annotations
 
@@ -76,18 +68,6 @@ def install_python_deps(repo_dir: Path) -> None:
         ]
     )
     run([sys.executable, "-m", "pip", "install", "-r", str(repo_dir / "requirements.txt")])
-    run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            str(repo_dir / "third_party" / "mast3r" / "requirements.txt"),
-            "-r",
-            str(repo_dir / "third_party" / "mast3r" / "dust3r" / "requirements.txt"),
-        ]
-    )
 
 
 def copy_tar_to_local(src_tar: Path, local_tar: Path, overwrite: bool) -> None:
@@ -172,10 +152,6 @@ def has_prepared_epipolar(scene_root: Path) -> bool:
     return all(path.exists() for path in required)
 
 
-def has_court_line_masks(scene_root: Path) -> bool:
-    return (scene_root / "mast3r" / "court_line_masks.npy").exists()
-
-
 def verify_runtime(repo_dir: Path) -> None:
     env = os.environ.copy()
     env.setdefault("MPLBACKEND", "Agg")
@@ -192,11 +168,6 @@ print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 
 
 
 def train(repo_dir: Path, data_link: Path, args: argparse.Namespace) -> None:
-    if args.use_court_line_weighted_loss and not has_court_line_masks(data_link):
-        raise FileNotFoundError(
-            f"{data_link / 'mast3r' / 'court_line_masks.npy'} is missing, "
-            "but court-line weighted loss is enabled."
-        )
     result_dir = Path(args.result_dir).expanduser()
     result_dir.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -224,10 +195,6 @@ def train(repo_dir: Path, data_link: Path, args: argparse.Namespace) -> None:
         cmd.append("--use-corres-epipolar-loss")
     else:
         cmd.append("--no-use-corres-epipolar-loss")
-    if args.use_court_line_weighted_loss:
-        cmd.append("--use-court-line-weighted-loss")
-    else:
-        cmd.append("--no-use-court-line-weighted-loss")
     for extra in args.extra_train_arg:
         cmd.extend(extra.split())
     env = os.environ.copy()
@@ -244,7 +211,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drive-mount-point", default=str(DEFAULT_DRIVE_MOUNT))
     parser.add_argument("--result-dir", default=str(DEFAULT_RESULT_ROOT / "tennis_court_colab"))
     parser.add_argument("--repo-data-link-name", default="data_scene")
-    parser.add_argument("--data-factor", type=int, default=1)
+    parser.add_argument("--data-factor", type=int, default=4)
     parser.add_argument("--pair-window", type=int, default=2)
     parser.add_argument("--min-shared-points", type=int, default=64)
     parser.add_argument("--num-correspondences", type=int, default=256)
@@ -255,7 +222,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-steps", nargs="+", type=int, default=[7000, 30000])
     parser.add_argument("--tb-every", type=int, default=100)
     parser.add_argument("--use-epipolar-loss", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--use-court-line-weighted-loss", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--extra-train-arg", action="append", default=[], help="Extra trainer CLI fragment.")
     parser.add_argument("--skip-drive-mount", action="store_true")
     parser.add_argument("--force-remount-drive", action="store_true")
@@ -320,7 +286,7 @@ def main() -> None:
             raise RuntimeError("Scene root is unavailable. Run extract_tar first.")
         enter_phase("prepare_scene", "running integrated MASt3R preprocessing and creating repo data link")
         data_link = ensure_repo_link(repo_dir, scene_root, args.repo_data_link_name)
-        if has_prepared_scene(scene_root) and has_prepared_epipolar(scene_root):
+        if has_prepared_scene(scene_root):
             print(f"Found prepackaged MASt3R scene metadata under {scene_root}; skipping preprocess.py", flush=True)
         else:
             run(
@@ -329,10 +295,6 @@ def main() -> None:
                     "scripts/preprocess.py",
                     "--scene_dir",
                     str(data_link),
-                    "--mast3r_repo",
-                    str(repo_dir / "third_party" / "mast3r"),
-                    "--mast3r_python",
-                    sys.executable,
                     "--test_every",
                     "8",
                     "--shared_intrinsics",
