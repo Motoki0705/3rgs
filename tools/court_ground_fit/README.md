@@ -2,29 +2,45 @@
 
 テニスコートのラインマスクを、推定された地面平面上で扱うためのツール群です。
 
-このディレクトリには、独立した 2 つのスクリプトがあります。
+このディレクトリには、連続した 2 つのスクリプトがあります。
 
 - `project_court_lines_to_ground.py`
-  各カメラのコートラインマスクを地面平面へ投影し、俯瞰画像や統計情報を保存します。
+  各カメラのコートラインマスクを地面平面へ投影し、
+  後段が使う最小成果物を `data/.../court/ground/` に保存します。
 - `fit_from_ground_heatmap.py`
   地面平面上に集約したヒートマップに対して 2 面コートのテンプレートを当てはめ、
   chunk 単位の fit と clustering を行い、支配的クラスタを再 fit して
-  `init_sim3.json` 形式の初期値を出力します。
-
-どちらも `tools/fit_court_sim3.py` とは独立しています。
+  最終 transform を `data/.../court/transform/` に出力します。
 
 ## 入力
 
 以下のファイルを前提とします。
 
+- `<scene_dir>/court/line/court_line_masks.npy`
 - `<scene_dir>/images_train.txt`
 - `<scene_dir>/mast3r/camera_intrinsics.npy`
 - `<scene_dir>/mast3r/camera_poses.npy`
-- `<scene_dir>/mast3r/court_line_masks.npy`
+- `<scene_dir>/mast3r/pointcloud.ply` もしくは同等の MASt3R 点群
 
 デフォルトの対象シーンは以下です。
 
 - `data/tennis_court`
+
+## ディレクトリ構成
+
+正規成果物:
+
+- `<scene_dir>/court/ground/plane_frame.json`
+- `<scene_dir>/court/ground/projected_train.npz`
+- `<scene_dir>/court/ground/manifest.json`
+- `<scene_dir>/court/transform/ground_heatmap_fit.json`
+- `<scene_dir>/court/transform/ground_heatmap_fit_sim3.json`
+- `<scene_dir>/court/transform/manifest.json`
+
+デバッグ可視化:
+
+- `results/tennis_court/court/ground/`
+- `results/tennis_court/court/transform/`
 
 ## 使い方
 
@@ -45,7 +61,9 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py
 ```bash
 python tools/court_ground_fit/fit_from_ground_heatmap.py \
   --scene-dir data/tennis_court \
-  --output-dir results/tennis_court/court_ground_heatmap_fit \
+  --ground-dir data/tennis_court/court/ground \
+  --transform-dir data/tennis_court/court/transform \
+  --output-dir results/tennis_court/court/transform \
   --adjacent-court-direction +x
 ```
 
@@ -53,21 +71,30 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 
 `fit_from_ground_heatmap.py` の出力:
 
-- `init_sim3_from_ground_heatmap.json`
-- `metadata.json`
-- `heatmaps.npz`
-- `dominant_cluster_overlay.png`
-- `selected_fit_overlay.png`
-- `chunk_overlays_contact_sheet.png`
-- `chunks/*.png`
+- 正規成果物
+  - `data/.../court/transform/ground_heatmap_fit.json`
+  - `data/.../court/transform/ground_heatmap_fit_sim3.json`
+  - `data/.../court/transform/manifest.json`
+- デバッグ成果物
+  - `results/.../court/transform/metadata.json`
+  - `results/.../court/transform/heatmaps.npz`
+  - `results/.../court/transform/dominant_cluster_overlay.png`
+  - `results/.../court/transform/selected_fit_overlay.png`
+  - `results/.../court/transform/chunk_overlays_contact_sheet.png`
+  - `results/.../court/transform/chunks/*.png`
 
 `project_court_lines_to_ground.py` の出力:
 
-- `merged_projection_heatmap.png`
-- `merged_projection_binary.png`
-- `per_camera/*.png`
-- `per_camera_contact_sheet.png`
-- `metadata.json`
+- 正規成果物
+  - `data/.../court/ground/plane_frame.json`
+  - `data/.../court/ground/projected_train.npz`
+  - `data/.../court/ground/manifest.json`
+- デバッグ成果物
+  - `results/.../court/ground/merged_projection_heatmap.png`
+  - `results/.../court/ground/merged_projection_binary.png`
+  - `results/.../court/ground/per_camera/*.png`
+  - `results/.../court/ground/per_camera_contact_sheet.png`
+  - `results/.../court/ground/metadata.json`
 
 ## 出力の見方
 
@@ -80,6 +107,7 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 
 ## 注意
 
+- `fit_from_ground_heatmap.py` は `project_court_lines_to_ground.py` の成果物を直接読み込みます。
 - この fit は画像平面ではなく、推定された地面平面上で行います。
 - chunk clustering は、カメラポーズのドリフトの影響を減らすために入れています。
 - 再 fit に失敗した場合は、最良の chunk fit にフォールバックします。
