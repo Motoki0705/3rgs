@@ -10,17 +10,15 @@
 - `fit_from_ground_heatmap.py`
   地面平面上に集約したヒートマップに対して 2 面コートのテンプレートを当てはめ、
   chunk 単位の fit と clustering を行い、支配的クラスタを再 fit して
-  最終 transform を `data/.../court/transform/` に出力します。
+  `court/transform/init_sim3.json` を seed に最終 transform を `data/.../court/transform/` に出力します。
 
 ## 入力
 
 以下のファイルを前提とします。
 
-- `<scene_dir>/court/line/court_line_masks.npy`
-- `<scene_dir>/images_train.txt`
-- `<scene_dir>/mast3r/camera_intrinsics.npy`
-- `<scene_dir>/mast3r/camera_poses.npy`
-- `<scene_dir>/mast3r/pointcloud.ply` もしくは同等の MASt3R 点群
+- `<scene_dir>/court/ground/plane_frame.json`
+- `<scene_dir>/court/ground/projected_train.npz`
+- `<scene_dir>/court/transform/init_sim3.json`
 
 デフォルトの対象シーンは以下です。
 
@@ -63,8 +61,8 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
   --scene-dir data/tennis_court \
   --ground-dir data/tennis_court/court/ground \
   --transform-dir data/tennis_court/court/transform \
-  --output-dir results/tennis_court/court/transform \
-  --adjacent-court-direction +x
+  --init-sim3-path data/tennis_court/court/transform/init_sim3.json \
+  --output-dir results/tennis_court/court/transform
 ```
 
 ## 主な出力
@@ -108,6 +106,7 @@ python tools/court_ground_fit/fit_from_ground_heatmap.py \
 ## 注意
 
 - `fit_from_ground_heatmap.py` は `project_court_lines_to_ground.py` の成果物を直接読み込みます。
+- `fit_from_ground_heatmap.py` は `court/transform/init_sim3.json` を seed として読み込み、`CourtInitEstimator` は呼びません。
 - この fit は画像平面ではなく、推定された地面平面上で行います。
 - chunk clustering は、カメラポーズのドリフトの影響を減らすために入れています。
 - 再 fit に失敗した場合は、最良の chunk fit にフォールバックします。

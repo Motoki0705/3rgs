@@ -83,11 +83,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ground-dir", type=Path, default=None)
     parser.add_argument("--transform-dir", type=Path, default=None)
     parser.add_argument(
+        "--init-sim3-path",
+        type=Path,
+        default=None,
+        help="Seed Sim(3) path. Defaults to <transform-dir>/init_sim3.json.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("results/tennis_court/court/transform"),
     )
-    parser.add_argument("--adjacent-court-direction", choices=("+x", "-x", "+y", "-y"), default="+x")
     parser.add_argument("--grid-resolution", type=float, default=0.04)
     parser.add_argument("--extent-margin", type=float, default=2.0)
     parser.add_argument("--extent-percentile", type=float, default=0.5)
@@ -102,7 +107,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-stride", type=int, default=6)
     parser.add_argument("--max-clusters", type=int, default=3)
     parser.add_argument("--min-silhouette", type=float, default=0.16)
-    parser.add_argument("--init-gap", type=float, default=3.0)
     parser.add_argument("--search-theta-step-deg", type=float, default=8.0)
     parser.add_argument("--search-theta-min-deg", type=float, default=0.25)
     parser.add_argument("--search-trans-step", type=float, default=1.25)
@@ -828,43 +832,41 @@ def dominant_cluster_camera_indices(records: list[ChunkFitRecord], labels: np.nd
     return dominant_label, dominant_cameras, cluster_summaries
 
 
-def initial_params_from_ground(ground: dict[str, np.ndarray | float], adjacent_direction: str, init_gap: float) -> dict[str, float]:
-    estimator_scale = float(0.25)
-    estimator_theta = 0.0
-    estimator_tx = 0.0
-    estimator_ty = 0.0
+def load_init_sim3_seed(
+    init_sim3_path: Path,
+    ground: dict[str, np.ndarray | float],
+) -> tuple[dict[str, float], str, dict[str, Any]]:
+    if not init_sim3_path.exists():
+        raise FileNotFoundError(f"Missing init Sim(3) seed: {init_sim3_path}")
+
+    payload = json.loads(init_sim3_path.read_text(encoding="utf-8"))
     axis_x = np.asarray(ground["axis_x"], dtype=np.float64)
     axis_y = np.asarray(ground["axis_y"], dtype=np.float64)
     plane_normal = np.asarray(ground["plane_normal"], dtype=np.float64)
     origin = np.asarray(ground["origin"], dtype=np.float64)
-
-    from tools.scene_viewer.utils.court_init_estimator import CourtInitEstimator
-
-    mast3r_dir = ground.get("mast3r_dir")
-    estimator = CourtInitEstimator(
-        Path(str(mast3r_dir)).expanduser()
-        if mast3r_dir is not None
-        else Path("data/tennis_court/mast3r")
-    )
-    res = estimator.estimate()
-    estimator_scale = float(res["scale"])
-    rotation = np.asarray(res["rotation"], dtype=np.float64)
-    translation = np.asarray(res["translation"], dtype=np.float64)
+    rotation = np.asarray(payload["rotation"], dtype=np.float64)
+    translation = np.asarray(payload["translation"], dtype=np.float64)
     world_x = rotation[:, 0]
     theta = math.atan2(float(np.dot(world_x, axis_y)), float(np.dot(world_x, axis_x)))
-    estimator_theta = wrap_angle(theta)
-    estimator_tx = float(np.dot(translation - origin, axis_x))
-    estimator_ty = float(np.dot(translation - origin, axis_y))
+    seed_theta = wrap_angle(theta)
+    seed_tx = float(np.dot(translation - origin, axis_x))
+    seed_ty = float(np.dot(translation - origin, axis_y))
     if float(np.dot(rotation[:, 2], plane_normal)) < 0.0:
-        estimator_theta = wrap_angle(estimator_theta + math.pi)
+        seed_theta = wrap_angle(seed_theta + math.pi)
 
-    return {
-        "scale": estimator_scale,
-        "theta": estimator_theta,
-        "tx": estimator_tx,
-        "ty": estimator_ty,
-        "gap": float(init_gap),
-    }
+    adjacent_direction = str(payload["adjacent_direction"])
+    seed_gap = float(payload["adjacent_gap"])
+    return (
+        {
+            "scale": float(payload["scale"]),
+            "theta": seed_theta,
+            "tx": seed_tx,
+            "ty": seed_ty,
+            "gap": seed_gap,
+        },
+        adjacent_direction,
+        payload,
+    )
 
 
 def save_chunk_contact_sheet(chunk_images: list[Path], output_path: Path, thumb_size: int = 256, cols: int = 4) -> None:
@@ -891,6 +893,7 @@ def main() -> None:
     scene_dir = args.scene_dir.expanduser().resolve()
     ground_dir = args.ground_dir.expanduser().resolve() if args.ground_dir is not None else scene_dir / "court" / "ground"
     transform_dir = args.transform_dir.expanduser().resolve() if args.transform_dir is not None else scene_dir / "court" / "transform"
+    init_sim3_path = args.init_sim3_path.expanduser().resolve() if args.init_sim3_path is not None else transform_dir / "init_sim3.json"
     output_dir = args.output_dir.expanduser().resolve()
     chunk_dir = output_dir / "chunks"
     transform_dir.mkdir(parents=True, exist_ok=True)
@@ -902,7 +905,11 @@ def main() -> None:
     mast3r_dir = Path(str(ground["mast3r_dir"])).expanduser().resolve() if ground.get("mast3r_dir") else scene_dir / "mast3r"
     all_uv = np.concatenate([uv for uv in projected_uvs if uv.size > 0], axis=0)
     extent = choose_extent(all_uv, args.extent_percentile, args.extent_margin)
-    init_params = initial_params_from_ground(ground, args.adjacent_court_direction, args.init_gap)
+    init_params, adjacent_court_direction, init_sim3_payload = load_init_sim3_seed(
+        init_sim3_path,
+        ground,
+    )
+    fit_args = argparse.Namespace(**{**vars(args), "adjacent_court_direction": adjacent_court_direction})
 
     print("Running chunk-wise heatmap fits...", flush=True)
     chunk_records: list[ChunkFitRecord] = []
@@ -927,7 +934,7 @@ def main() -> None:
             extent,
             args.grid_resolution,
             init_params=chunk_init,
-            args=args,
+            args=fit_args,
             stage=f"chunk_{chunk_index:03d}",
             extra_seeds=extra_seeds,
         )
@@ -941,7 +948,7 @@ def main() -> None:
         )
         chunk_records.append(record)
         image_path = chunk_dir / f"chunk_{chunk_index:03d}_{start:03d}_{end:03d}.png"
-        cv2.imwrite(str(image_path), render_overlay(chunk_heatmap, chunk_fit, args.adjacent_court_direction, args.line_thickness_px))
+        cv2.imwrite(str(image_path), render_overlay(chunk_heatmap, chunk_fit, adjacent_court_direction, args.line_thickness_px))
         chunk_images.append(image_path)
         if np.isfinite(chunk_fit.total_loss):
             previous_fit = chunk_fit
@@ -980,11 +987,11 @@ def main() -> None:
         extent,
         args.grid_resolution,
         init_params=dominant_init,
-        args=args,
+        args=fit_args,
         stage="dominant_cluster_final",
         extra_seeds=extra_seeds,
     )
-    cv2.imwrite(str(output_dir / "dominant_cluster_overlay.png"), render_overlay(dominant_heatmap, final_fit, args.adjacent_court_direction, args.line_thickness_px))
+    cv2.imwrite(str(output_dir / "dominant_cluster_overlay.png"), render_overlay(dominant_heatmap, final_fit, adjacent_court_direction, args.line_thickness_px))
     cv2.imwrite(str(output_dir / "dominant_cluster_heatmap.png"), cv2.applyColorMap(np.clip(np.round(255.0 * dominant_heatmap.weights), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO))
     save_chunk_contact_sheet(chunk_images, output_dir / "chunk_overlays_contact_sheet.png")
 
@@ -998,7 +1005,7 @@ def main() -> None:
             extent,
             args.grid_resolution,
             init_params=best_chunk.fit.params,
-            args=args,
+            args=fit_args,
             stage="best_chunk_fallback",
             extra_seeds=[init_params],
         )
@@ -1006,17 +1013,19 @@ def main() -> None:
 
     cv2.imwrite(
         str(output_dir / "selected_fit_overlay.png"),
-        render_overlay(selected_heatmap, selected_fit, args.adjacent_court_direction, args.line_thickness_px),
+        render_overlay(selected_heatmap, selected_fit, adjacent_court_direction, args.line_thickness_px),
     )
-    sim3_payload = fit_to_sim3_payload(selected_fit, ground, args.adjacent_court_direction)
+    sim3_payload = fit_to_sim3_payload(selected_fit, ground, adjacent_court_direction)
     fit_result_path = transform_dir / "ground_heatmap_fit.json"
     fit_result = {
         "scene_dir": str(scene_dir),
         "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
+        "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
-        "adjacent_court_direction": args.adjacent_court_direction,
+        "adjacent_court_direction": adjacent_court_direction,
+        "seed_sim3": init_sim3_payload,
         "selected_fit_source": selected_fit_source,
         "dominant_cluster": int(dominant_label),
         "dominant_cameras": dominant_cameras,
@@ -1036,6 +1045,7 @@ def main() -> None:
         "scene_dir": str(scene_dir),
         "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
+        "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
         "transform_dir": str(transform_dir),
@@ -1049,11 +1059,13 @@ def main() -> None:
         "scene_dir": str(scene_dir),
         "ground_dir": str(ground_dir),
         "mast3r_dir": str(mast3r_dir),
+        "init_sim3_path": str(init_sim3_path),
         "plane_frame_path": ground_inputs["plane_frame_path"],
         "projected_train_path": ground_inputs["projected_train_path"],
         "output_dir": str(output_dir),
         "transform_dir": str(transform_dir),
-        "adjacent_court_direction": args.adjacent_court_direction,
+        "adjacent_court_direction": adjacent_court_direction,
+        "seed_sim3": init_sim3_payload,
         "extent_xy": [float(v) for v in extent],
         "grid_resolution": float(args.grid_resolution),
         "ground_plane": {
@@ -1097,6 +1109,7 @@ def main() -> None:
         dominant_cameras=np.asarray(dominant_cameras, dtype=np.int32),
     )
 
+    print(f"Loaded seed Sim(3) from {init_sim3_path}", flush=True)
     print(f"Saved fit result to {fit_result_path}", flush=True)
     print(f"Saved final Sim(3) to {sim3_path}", flush=True)
     print(f"Saved metadata to {output_dir / 'metadata.json'}", flush=True)
